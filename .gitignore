@@ -3,3 +3,8 @@ data/
 *.tsv
 *.log
 *.tmp
+distilbert_model/
+checkpoints/
+distilbert_tmp/
+distilbert_outputs/
+__pycache__/
