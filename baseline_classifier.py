@@ -21,6 +21,8 @@ from sklearn.model_selection import train_test_split
 from torch import nn
 from torch.utils.data import DataLoader, Dataset
 
+from ademamix import AdEMAMix
+
 
 DEFAULT_DATA_DIR = Path("data/twitter-datasets")
 
@@ -99,13 +101,57 @@ def parse_args() -> argparse.Namespace:
         "--lr",
         type=float,
         default=1e-2,
-        help="Learning rate for Adam.",
+        help="Learning rate for AdEMAMix.",
+    )
+    parser.add_argument(
+        "--patience",
+        type=int,
+        default=2,
+        help="Early stopping patience (number of epochs without improvement before stopping).",
+    )
+    parser.add_argument(
+        "--early-metric",
+        type=str,
+        choices=["loss", "acc"],
+        default="loss",
+        help="Metric to monitor for early stopping.",
+    )
+    parser.add_argument(
+        "--min-delta",
+        type=float,
+        default=0.0,
+        help="Minimum improvement required to reset early stopping patience.",
+    )
+    parser.add_argument(
+        "--betas",
+        type=float,
+        nargs=3,
+        default=(0.9, 0.999, 0.9999),
+        help="Beta coefficients for AdEMAMix (beta1 beta2 beta3).",
+    )
+    parser.add_argument(
+        "--alpha-mix",
+        type=float,
+        default=2.0,
+        help="Alpha mixing coefficient for AdEMAMix.",
+    )
+    parser.add_argument(
+        "--beta3-warmup",
+        type=int,
+        default=0,
+        help="Warmup steps for beta3 (0 disables).",
+    )
+    parser.add_argument(
+        "--alpha-warmup",
+        type=int,
+        default=0,
+        help="Warmup steps for alpha mix (0 disables).",
     )
     parser.add_argument(
         "--weight-decay",
         type=float,
         default=1e-6,
-        help="L2 weight decay for Adam.",
+        help="Weight decay for AdEMAMix.",
     )
     parser.add_argument(
         "--output",
@@ -396,12 +442,21 @@ def fit_model(
             num_workers=0,
         )
         model = HashedLogisticModel(args.num_features).to(device)
-        optimizer = torch.optim.Adam(
+        optimizer = AdEMAMix(
             model.parameters(),
             lr=args.lr,
+            betas=tuple(args.betas),
+            alpha=args.alpha_mix,
+            beta3_warmup=args.beta3_warmup or None,
+            alpha_warmup=args.alpha_warmup or None,
             weight_decay=args.weight_decay,
         )
         criterion = nn.BCEWithLogitsLoss()
+
+        best_state = None
+        best_metric = None
+        best_epoch = 0
+        epochs_no_improve = 0
 
         for epoch in range(1, args.epochs + 1):
             train_loss, train_acc = train_epoch(model, train_loader, criterion, optimizer, device)
@@ -411,11 +466,39 @@ def fit_model(
                 f"train loss {train_loss:.4f} acc {train_acc:.4f} | "
                 f"val loss {val_loss:.4f} acc {val_acc:.4f}"
             )
+            current_metric = val_loss if args.early_metric == "loss" else val_acc
+            improved = False
+            if best_metric is None:
+                improved = True
+            elif args.early_metric == "loss":
+                improved = current_metric < best_metric - args.min_delta
+            else:
+                improved = current_metric > best_metric + args.min_delta
+
+            if improved:
+                best_metric = current_metric
+                best_epoch = epoch
+                best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+                epochs_no_improve = 0
+            else:
+                epochs_no_improve += 1
+                if epochs_no_improve > args.patience:
+                    print(f"Early stopping triggered at epoch {epoch}; best epoch was {best_epoch}.")
+                    break
+
+        if best_state is not None:
+            model.load_state_dict(best_state)
+            model.to(device)
+            print(f"Loaded best checkpoint from epoch {best_epoch} (metric={best_metric:.4f}).")
     else:
         model = HashedLogisticModel(args.num_features).to(device)
-        optimizer = torch.optim.Adam(
+        optimizer = AdEMAMix(
             model.parameters(),
             lr=args.lr,
+            betas=tuple(args.betas),
+            alpha=args.alpha_mix,
+            beta3_warmup=args.beta3_warmup or None,
+            alpha_warmup=args.alpha_warmup or None,
             weight_decay=args.weight_decay,
         )
         criterion = nn.BCEWithLogitsLoss()
@@ -482,34 +565,6 @@ def main() -> None:
     texts, labels = load_labeled_data(config)
     model = fit_model(texts, labels, args, device)
 
-    # Refit on all data to use every labeled example.
-    set_seed(args.random_state)
-    full_model = HashedLogisticModel(args.num_features).to(device)
-    optimizer = torch.optim.Adam(
-        full_model.parameters(),
-        lr=args.lr,
-        weight_decay=args.weight_decay,
-    )
-    criterion = nn.BCEWithLogitsLoss()
-    full_ds = HashedTweetDataset(
-        texts,
-        labels,
-        args.num_features,
-        args.ngram_max,
-        args.random_state,
-        args.lowercase,
-    )
-    full_loader = DataLoader(
-        full_ds,
-        batch_size=args.batch_size,
-        shuffle=True,
-        collate_fn=collate_train,
-        num_workers=0,
-    )
-    for epoch in range(1, args.epochs + 1):
-        train_loss, train_acc = train_epoch(full_model, full_loader, criterion, optimizer, device)
-        print(f"[full fit epoch {epoch}/{args.epochs}] loss {train_loss:.4f} acc {train_acc:.4f}")
-
     test_ids, test_texts = load_test_data(config.test_path)
     test_ds = HashedTweetDataset(
         test_texts,
@@ -527,7 +582,7 @@ def main() -> None:
         collate_fn=lambda batch: collate_infer([(feats, tid) for feats, tid in batch]),
         num_workers=0,
     )
-    test_preds = predict_on_loader(full_model, test_loader, device)
+    test_preds = predict_on_loader(model, test_loader, device)
     write_submission(test_ids, test_preds, args.output)
 
 
