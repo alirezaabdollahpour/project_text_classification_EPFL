@@ -1,12 +1,3 @@
-"""
-GPU-enabled baseline tweet sentiment classifier.
-
-This script trains a simple hashed bag-of-words logistic model on GPU
-(PyTorch + EmbeddingBag) and exports predictions for the provided test set.
-
-Example:
-    python baseline_classifier.py --use-full --device cuda --output baseline_submission.csv
-"""
 from __future__ import annotations
 
 import argparse
