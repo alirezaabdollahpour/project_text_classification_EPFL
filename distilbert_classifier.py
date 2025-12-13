@@ -12,13 +12,13 @@ from sklearn.model_selection import train_test_split
 from torch.optim.swa_utils import AveragedModel, SWALR, update_bn
 from torch.utils.data import DataLoader
 from transformers import (
+    AutoModelForSequenceClassification,
+    AutoTokenizer,
     DataCollatorWithPadding,
-    DistilBertForSequenceClassification,
-    DistilBertTokenizerFast,
     set_seed,
 )
 
-from ademamix import AdEMAMix
+from ademamix import AdEMAMix, alpha_scheduler, beta3_scheduler
 
 DEFAULT_DATA_DIR = Path("data/twitter-datasets")
 
@@ -68,6 +68,18 @@ def choose_device(name: str) -> torch.device:
     return torch.device(name)
 
 
+def preprocess_tweet(text: str) -> str:
+    tokens = []
+    for tok in text.split():
+        if tok.startswith("@") and len(tok) > 1:
+            tokens.append("@user")
+        elif tok.startswith("http"):
+            tokens.append("http")
+        else:
+            tokens.append(tok)
+    return " ".join(tokens)
+
+
 def read_labeled(path: Path, label: int, limit: int | None) -> Tuple[List[str], List[int]]:
     texts: List[str] = []
     labels: List[int] = []
@@ -77,7 +89,7 @@ def read_labeled(path: Path, label: int, limit: int | None) -> Tuple[List[str], 
                 break
             cleaned = line.strip()
             if cleaned:
-                texts.append(cleaned)
+                texts.append(preprocess_tweet(cleaned))
                 labels.append(label)
     return texts, labels
 
@@ -103,7 +115,7 @@ def load_test_data(path: Path) -> Tuple[List[int], List[str]]:
                 continue
             id_str, tweet = cleaned.split(",", 1)
             ids.append(int(id_str))
-            texts.append(tweet.strip())
+            texts.append(preprocess_tweet(tweet.strip()))
     print(f"Loaded {len(ids)} test tweets from {path}.")
     return ids, texts
 
@@ -206,9 +218,14 @@ def main() -> None:
     set_seed(args.seed)
     random.seed(args.seed)
     print(f"Using device: {device}")
+    effective_batch = args.per_device_train_batch_size * args.gradient_accumulation_steps
+    print(
+        f"Effective train batch size (per device x grad accumulation): "
+        f"{args.per_device_train_batch_size} x {args.gradient_accumulation_steps} = {effective_batch}"
+    )
 
-    tokenizer = DistilBertTokenizerFast.from_pretrained(args.model_name, use_fast=True)
-    model = DistilBertForSequenceClassification.from_pretrained(
+    tokenizer = AutoTokenizer.from_pretrained(args.model_name, use_fast=True)
+    model = AutoModelForSequenceClassification.from_pretrained(
         args.model_name,
         num_labels=2,
     )
@@ -247,14 +264,36 @@ def main() -> None:
     steps_per_epoch = math.ceil(len(train_loader) / args.gradient_accumulation_steps)
     total_steps = args.epochs * steps_per_epoch
 
+    no_decay = ["bias", "LayerNorm.weight", "LayerNorm.bias"]
+    optimizer_grouped_parameters = [
+        {
+            "params": [p for n, p in model.named_parameters() if not any(nd in n for nd in no_decay)],
+            "weight_decay": args.weight_decay,
+        },
+        {
+            "params": [p for n, p in model.named_parameters() if any(nd in n for nd in no_decay)],
+            "weight_decay": 0.0,
+        },
+    ]
+
+    alpha_sched = alpha_scheduler(
+        alpha_end=args.alpha_mix,
+        alpha_start=0.0,
+        warmup=args.alpha_warmup or 0,
+    )
+    beta3_sched = beta3_scheduler(
+        beta_end=args.betas[2],
+        beta_start=args.betas[0],
+        warmup=args.beta3_warmup or 0,
+    )
+
     optimizer = AdEMAMix(
-        model.parameters(),
+        optimizer_grouped_parameters,
         lr=args.lr,
         betas=tuple(args.betas),
         alpha=args.alpha_mix,
-        beta3_warmup=args.beta3_warmup or None,
-        alpha_warmup=args.alpha_warmup or None,
-        weight_decay=args.weight_decay,
+        beta3_scheduler=beta3_sched,
+        alpha_scheduler=alpha_sched,
     )
     scheduler = (
         torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=total_steps, eta_min=args.eta_min)
@@ -267,7 +306,7 @@ def main() -> None:
 
     use_swa = args.use_swa
     swa_model = AveragedModel(model) if use_swa else None
-    swa_start_step = max(0, args.swa_start_epoch - 1) * len(train_loader)
+    swa_start_step = max(0, args.swa_start_epoch - 1) * steps_per_epoch
     swa_scheduler = (
         SWALR(optimizer, swa_lr=args.swa_lr if args.swa_lr is not None else args.lr)
         if use_swa
@@ -312,8 +351,8 @@ def main() -> None:
                 if use_swa and global_step >= swa_start_step:
                     if (global_step - swa_start_step) % args.swa_freq == 0:
                         swa_model.update_parameters(model)
-                    swa_scheduler.step()
-                elif scheduler is not None:
+                elif scheduler is not None and (not use_swa or global_step < swa_start_step):
+                    # Stop cosine decay after SWA starts to keep LR flatter during averaging.
                     scheduler.step()
 
             running_loss += loss.item() * labels.size(0)
@@ -325,6 +364,9 @@ def main() -> None:
         eval_model = swa_model if use_swa and global_step >= swa_start_step else model
         val_loss, val_acc = evaluate(eval_model, val_loader, device)
         print(f"[epoch {epoch}/{args.epochs}] val loss {val_loss:.4f} acc {val_acc:.4f}")
+
+        if use_swa and global_step >= swa_start_step:
+            swa_scheduler.step()
 
         current_metric = val_acc if args.metric == "accuracy" else val_loss
         improved = False
