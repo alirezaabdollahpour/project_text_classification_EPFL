@@ -2,21 +2,26 @@ from __future__ import annotations
 
 import argparse
 import random
+import pickle
 from pathlib import Path
 import math
-from typing import Iterable, List, Tuple
+from typing import Dict, Iterable, List, Tuple
 
+import numpy as np
 import torch
+import torch.nn as nn
 from datasets import Dataset
 from sklearn.model_selection import train_test_split
 from torch.optim.swa_utils import AveragedModel, SWALR, update_bn
 from torch.utils.data import DataLoader
 from transformers import (
+    AutoModel,
     AutoModelForSequenceClassification,
     AutoTokenizer,
     DataCollatorWithPadding,
     set_seed,
 )
+from transformers.modeling_outputs import SequenceClassifierOutput
 
 from ademamix import AdEMAMix, alpha_scheduler, beta3_scheduler
 
@@ -56,6 +61,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--metric", type=str, choices=["accuracy", "eval_loss"], default="accuracy", help="Metric for best model.")
     parser.add_argument("--min-delta", type=float, default=0.0, help="Minimum improvement to reset patience.")
     parser.add_argument("--fp16", action="store_true", help="Use fp16 mixed precision if supported.")
+    parser.add_argument("--embedding-path", type=Path, default=None, help="Optional .npy word embedding matrix (from GloVe).")
+    parser.add_argument("--embedding-vocab", type=Path, default=None, help="Vocabulary pickle aligned with the embedding matrix.")
+    parser.add_argument(
+        "--embedding-scale",
+        type=float,
+        default=1.0,
+        help="Scale factor applied to averaged embeddings (useful if magnitudes differ from transformer outputs).",
+    )
+    parser.add_argument(
+        "--fusion-dropout",
+        type=float,
+        default=None,
+        help="Dropout rate when mixing transformer features and averaged embeddings (defaults to model config).",
+    )
     return parser.parse_args()
 
 
@@ -66,6 +85,111 @@ def choose_device(name: str) -> torch.device:
         print("CUDA requested but not available; falling back to CPU.")
         return torch.device("cpu")
     return torch.device(name)
+
+
+class TweetEmbeddingAverager:
+    """Average pre-computed word embeddings (e.g., GloVe) for a tweet."""
+
+    def __init__(self, embedding_matrix: np.ndarray, vocab: Dict[str, int], scale: float = 1.0) -> None:
+        self.embedding_matrix = embedding_matrix.astype(np.float32)
+        self.vocab = vocab
+        self.scale = scale
+        self.dim = self.embedding_matrix.shape[1]
+        self.zero = np.zeros(self.dim, dtype=np.float32)
+
+    def __call__(self, text: str) -> np.ndarray:
+        indices = [
+            idx
+            for tok in text.split()
+            if (idx := self.vocab.get(tok)) is not None and 0 <= idx < self.embedding_matrix.shape[0]
+        ]
+        if not indices:
+            return self.zero.copy()
+        vectors = self.embedding_matrix[indices]
+        if vectors.ndim == 1:
+            vectors = vectors.reshape(1, -1)
+        return (vectors.mean(axis=0) * self.scale).astype(np.float32)
+
+
+def load_embedding_lookup(vocab_path: Path, embedding_path: Path, scale: float) -> TweetEmbeddingAverager:
+    with vocab_path.open("rb") as handle:
+        vocab = pickle.load(handle)
+    embedding_matrix = np.load(embedding_path)
+    if embedding_matrix.ndim != 2:
+        raise ValueError(f"Expected a 2-D embedding matrix, got shape {embedding_matrix.shape}.")
+    print(f"Loaded embeddings from {embedding_path} with shape {embedding_matrix.shape}")
+    print(f"Loaded vocabulary with {len(vocab)} entries from {vocab_path}")
+    return TweetEmbeddingAverager(embedding_matrix, vocab, scale=scale)
+
+
+class HybridCollator:
+    """Pad token inputs and stack auxiliary averaged embeddings when provided."""
+
+    def __init__(self, tokenizer) -> None:
+        self.base_collator = DataCollatorWithPadding(tokenizer=tokenizer)
+
+    def __call__(self, features):
+        has_extra = "extra_features" in features[0]
+        token_features = [{k: v for k, v in feat.items() if k != "extra_features"} for feat in features]
+        batch = self.base_collator(token_features)
+        if has_extra:
+            extras = [torch.as_tensor(feat["extra_features"], dtype=torch.float32) for feat in features]
+            batch["extra_features"] = torch.stack(extras, dim=0)
+        return batch
+
+
+class HybridTransformerClassifier(nn.Module):
+    """Transformer encoder with optional averaged word embeddings fused into the classifier."""
+
+    def __init__(self, model_name: str, num_labels: int, extra_dim: int = 0, dropout: float | None = None) -> None:
+        super().__init__()
+        self.transformer = AutoModel.from_pretrained(model_name)
+        self.extra_dim = extra_dim
+
+        hidden_size = self.transformer.config.hidden_size
+        drop_rate = (
+            dropout
+            if dropout is not None
+            else getattr(self.transformer.config, "seq_classif_dropout", getattr(self.transformer.config, "dropout", 0.1))
+        )
+        self.dropout = nn.Dropout(drop_rate)
+        if extra_dim > 0:
+            self.extra_proj = nn.Sequential(
+                nn.LayerNorm(extra_dim),
+                nn.Linear(extra_dim, hidden_size),
+                nn.GELU(),
+            )
+            fused_dim = hidden_size * 2
+        else:
+            self.extra_proj = None
+            fused_dim = hidden_size
+
+        self.classifier = nn.Sequential(
+            nn.Linear(fused_dim, hidden_size),
+            nn.GELU(),
+            nn.Dropout(drop_rate),
+            nn.Linear(hidden_size, num_labels),
+        )
+
+    def forward(
+        self,
+        input_ids=None,
+        attention_mask=None,
+        extra_features=None,
+        labels=None,
+    ) -> SequenceClassifierOutput:
+        outputs = self.transformer(input_ids=input_ids, attention_mask=attention_mask)
+        pooled = outputs.last_hidden_state[:, 0]
+
+        if self.extra_proj is not None and extra_features is not None:
+            extra = self.extra_proj(extra_features.to(dtype=pooled.dtype))
+            pooled = torch.cat([pooled, extra], dim=1)
+
+        logits = self.classifier(self.dropout(pooled))
+        loss = None
+        if labels is not None:
+            loss = nn.functional.cross_entropy(logits, labels)
+        return SequenceClassifierOutput(logits=logits, loss=loss)
 
 
 def preprocess_tweet(text: str) -> str:
@@ -127,6 +251,7 @@ def build_datasets(
     val_size: float,
     max_length: int,
     seed: int,
+    embedding_lookup: TweetEmbeddingAverager | None = None,
 ):
     train_texts, val_texts, train_labels, val_labels = train_test_split(
         texts,
@@ -139,28 +264,39 @@ def build_datasets(
     val_ds = Dataset.from_dict({"text": val_texts, "label": val_labels})
 
     def tokenize_batch(batch):
-        return tokenizer(
+        tokenized = tokenizer(
             batch["text"],
             truncation=True,
             padding=False,
             max_length=max_length,
         )
+        if embedding_lookup is not None:
+            tokenized["extra_features"] = [embedding_lookup(text) for text in batch["text"]]
+        return tokenized
 
     tokenized_train = train_ds.map(tokenize_batch, batched=True, remove_columns=["text"])
     tokenized_val = val_ds.map(tokenize_batch, batched=True, remove_columns=["text"])
     return tokenized_train, tokenized_val
 
 
-def build_test_dataset(tokenizer: DistilBertTokenizerFast, texts: List[str], max_length: int):
+def build_test_dataset(
+    tokenizer: DistilBertTokenizerFast,
+    texts: List[str],
+    max_length: int,
+    embedding_lookup: TweetEmbeddingAverager | None = None,
+):
     ds = Dataset.from_dict({"text": texts})
 
     def tokenize_batch(batch):
-        return tokenizer(
+        tokenized = tokenizer(
             batch["text"],
             truncation=True,
             padding=False,
             max_length=max_length,
         )
+        if embedding_lookup is not None:
+            tokenized["extra_features"] = [embedding_lookup(text) for text in batch["text"]]
+        return tokenized
 
     tokenized = ds.map(tokenize_batch, batched=True, remove_columns=["text"])
     return tokenized
@@ -224,25 +360,54 @@ def main() -> None:
         f"{args.per_device_train_batch_size} x {args.gradient_accumulation_steps} = {effective_batch}"
     )
 
+    if (args.embedding_path is None) != (args.embedding_vocab is None):
+        raise ValueError("Both --embedding-path and --embedding-vocab are required to enable averaged embeddings.")
+
+    embedding_lookup = (
+        load_embedding_lookup(args.embedding_vocab, args.embedding_path, args.embedding_scale)
+        if args.embedding_path is not None and args.embedding_vocab is not None
+        else None
+    )
+    if embedding_lookup is not None:
+        print(f"Enabling averaged word embeddings (dim={embedding_lookup.dim}) for fusion with transformer outputs.")
+
     tokenizer = AutoTokenizer.from_pretrained(args.model_name, use_fast=True)
-    model = AutoModelForSequenceClassification.from_pretrained(
-        args.model_name,
-        num_labels=2,
+    model = (
+        HybridTransformerClassifier(
+            args.model_name,
+            num_labels=2,
+            extra_dim=embedding_lookup.dim,
+            dropout=args.fusion_dropout,
+        )
+        if embedding_lookup is not None
+        else AutoModelForSequenceClassification.from_pretrained(
+            args.model_name,
+            num_labels=2,
+        )
     )
     model.to(device)
 
     texts, labels = load_train_data(args.data_dir, args.use_full, args.limit_per_class)
-    train_ds, val_ds = build_datasets(tokenizer, texts, labels, args.val_size, args.max_length, args.seed)
+    train_ds, val_ds = build_datasets(
+        tokenizer,
+        texts,
+        labels,
+        args.val_size,
+        args.max_length,
+        args.seed,
+        embedding_lookup=embedding_lookup,
+    )
 
     test_ids, test_texts = load_test_data(args.data_dir / "test_data.txt")
-    test_ds = build_test_dataset(tokenizer, test_texts, args.max_length)
+    test_ds = build_test_dataset(tokenizer, test_texts, args.max_length, embedding_lookup=embedding_lookup)
 
     # Prepare torch datasets/dataloaders
-    train_ds.set_format(type="torch", columns=["input_ids", "attention_mask", "label"])
-    val_ds.set_format(type="torch", columns=["input_ids", "attention_mask", "label"])
-    test_ds.set_format(type="torch", columns=["input_ids", "attention_mask"])
+    extra_columns = ["extra_features"] if embedding_lookup is not None else []
+    train_ds.set_format(type="torch", columns=["input_ids", "attention_mask", "label"] + extra_columns)
+    val_ds.set_format(type="torch", columns=["input_ids", "attention_mask", "label"] + extra_columns)
+    test_ds.set_format(type="torch", columns=["input_ids", "attention_mask"] + extra_columns)
 
-    data_collator = DataCollatorWithPadding(tokenizer=tokenizer)
+    data_collator = HybridCollator(tokenizer) if embedding_lookup is not None else DataCollatorWithPadding(tokenizer=tokenizer)
     train_loader = DataLoader(
         train_ds,
         batch_size=args.per_device_train_batch_size,
