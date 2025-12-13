@@ -15,14 +15,23 @@ if [[ ! -f "$VOCAB_PATH" ]]; then
   exit 1
 fi
 
-python distilbert_classifier.py --use-full --device cuda --epochs 3 \
+python distilbert_classifier.py --use-full --device cuda --epochs 2 \
   --model-name vinai/bertweet-base \
+   --use-lora --freeze-encoder \
+  --lora-target-modules 'auto' \
   --val-size 0.05 --metric accuracy --patience 2 --min-delta 0.001 \
   --per-device-train-batch-size 256 --per-device-eval-batch-size 256 \
-  --lr 4e-5 --weight-decay 0.01 --betas 0.9 0.999 0.9999 --alpha-mix 2.0 \
+  --lr 5e-5 --weight-decay 0.01 --betas 0.9 0.999 0.9999 --alpha-mix 2.0 \
   --beta3-warmup 2000 --alpha-warmup 2000 \
   --gradient-accumulation-steps 2 \
-  --eta-min 1e-6 \
   --output baseline_submission_distilbert.csv \
   --embedding-path "$EMB_PATH" --embedding-vocab "$VOCAB_PATH" \
+  --eval-steps 500 \
+  # --fusion-dropout 0.1 \
+    # --use-linear-scheduler --lr-warmup-steps 1000 \
+  # --estimate-embedding-scale --estimate-sample-size 10000 \
+  # --use-linear-scheduler --lr-warmup-steps 1000 \
+  # --embedding-path "$EMB_PATH" --embedding-vocab "$VOCAB_PATH" \
+  # --estimate-embedding-scale --estimate-sample-size 2000 \
+  
   # --use-swa --swa-start-epoch 1 --swa-freq 300 --swa-lr 2e-5 \
