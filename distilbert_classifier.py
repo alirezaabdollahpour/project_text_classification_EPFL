@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import random
 import pickle
+from collections import Counter
 from pathlib import Path
 import math
 from typing import Dict, Iterable, List, Tuple
@@ -23,7 +24,40 @@ from transformers import (
 )
 from transformers.modeling_outputs import SequenceClassifierOutput
 
+try:
+    from peft import LoraConfig, TaskType, get_peft_model
+    from peft.utils import TRANSFORMERS_MODELS_TO_LORA_TARGET_MODULES_MAPPING
+except ImportError:  # Optional dependency; only needed when --use-lora is set.
+    LoraConfig = None
+    TaskType = None
+    get_peft_model = None
+    TRANSFORMERS_MODELS_TO_LORA_TARGET_MODULES_MAPPING = {}
+
+try:
+    from transformers.pytorch_utils import Conv1D
+except ImportError:
+    Conv1D = None
+
 from ademamix import AdEMAMix, alpha_scheduler, beta3_scheduler
+
+COMMON_LORA_CANDIDATES = [
+    "q_lin",
+    "k_lin",
+    "v_lin",
+    "out_lin",
+    "q_proj",
+    "k_proj",
+    "v_proj",
+    "o_proj",
+    "out_proj",
+    "query",
+    "key",
+    "value",
+    "dense",
+    "c_attn",
+    "in_proj",
+    "Wqkv",
+]
 
 DEFAULT_DATA_DIR = Path("data/twitter-datasets")
 
@@ -48,6 +82,23 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--gradient-accumulation-steps", type=int, default=1, help="Gradient accumulation steps.")
     parser.add_argument("--logging-steps", type=int, default=100, help="Log every N steps.")
     parser.add_argument("--use-cosine-scheduler", action="store_true", help="Use cosine annealing LR scheduler for AdEMAMix.")
+    parser.add_argument(
+        "--use-linear-scheduler",
+        action="store_true",
+        help="Use linear warmup then decay LR scheduler for AdEMAMix (disables cosine).",
+    )
+    parser.add_argument(
+        "--lr-warmup-steps",
+        type=int,
+        default=0,
+        help="Warmup steps for linear LR scheduler (ignored for cosine/no scheduler).",
+    )
+    parser.add_argument(
+        "--eval-steps",
+        type=int,
+        default=0,
+        help="Run an interim validation every N optimizer steps (0 disables mid-epoch eval).",
+    )
     parser.add_argument("--eta-min", type=float, default=0.0, help="Minimum LR for cosine scheduler.")
     parser.add_argument("--use-swa", action="store_true", help="Enable stochastic weight averaging.")
     parser.add_argument("--swa-start-epoch", type=int, default=1, help="Epoch (1-indexed) to start SWA updates.")
@@ -75,6 +126,31 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Dropout rate when mixing transformer features and averaged embeddings (defaults to model config).",
     )
+    parser.add_argument(
+        "--estimate-embedding-scale",
+        action="store_true",
+        help="Estimate a recommended embedding scale from a small sample and apply it before training.",
+    )
+    parser.add_argument(
+        "--estimate-sample-size",
+        type=int,
+        default=2000,
+        help="Number of training tweets to sample when estimating embedding scale.",
+    )
+    parser.add_argument("--freeze-encoder", action="store_true", help="Freeze transformer backbone parameters.")
+    parser.add_argument("--use-lora", action="store_true", help="Enable LoRA adapters on the transformer backbone.")
+    parser.add_argument("--lora-r", type=int, default=8, help="LoRA rank.")
+    parser.add_argument("--lora-alpha", type=float, default=16.0, help="LoRA alpha scaling.")
+    parser.add_argument("--lora-dropout", type=float, default=0.1, help="LoRA dropout.")
+    parser.add_argument(
+        "--lora-target-modules",
+        type=str,
+        default="q_lin,k_lin,v_lin,out_lin",
+        help=(
+            "Comma-separated list of module names to target with LoRA (e.g., query,key,value,dense/q_lin,k_lin,v_lin,out_lin); "
+            "use 'auto' to pick sensible defaults for the chosen backbone."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -85,6 +161,84 @@ def choose_device(name: str) -> torch.device:
         print("CUDA requested but not available; falling back to CPU.")
         return torch.device("cpu")
     return torch.device(name)
+
+
+def _targetable_module_names(model) -> List[str]:
+    """Return names of modules that LoRA can wrap (linear/Conv1D)."""
+    targetable = [nn.Linear]
+    if Conv1D is not None:
+        targetable.append(Conv1D)
+    targetable_types = tuple(targetable)
+    return [name for name, module in model.named_modules() if isinstance(module, targetable_types)]
+
+
+def resolve_lora_targets(model, requested_targets: List[str] | None) -> List[str]:
+    """
+    Ensure target module names exist on the model; fall back to sensible defaults if not.
+    This prevents PEFT from raising when users switch architectures without updating targets.
+    """
+    module_names = _targetable_module_names(model)
+
+    def matches(target: str) -> bool:
+        return any(
+            name == target
+            or name.endswith(f".{target}")
+            or name.split(".")[-1] == target
+            for name in module_names
+        )
+
+    normalized = [t.strip() for t in (requested_targets or []) if t and t.strip()]
+    normalized = [t for t in normalized if t.lower() != "auto"]
+    if normalized and any(matches(t) for t in normalized):
+        return normalized
+
+    model_type = getattr(getattr(model, "config", None), "model_type", None)
+    auto_candidates: List[str] = []
+    if model_type:
+        auto_candidates.extend(TRANSFORMERS_MODELS_TO_LORA_TARGET_MODULES_MAPPING.get(model_type, []))
+    if model_type == "distilbert":
+        auto_candidates.extend(["q_lin", "k_lin", "v_lin", "out_lin"])
+
+    resolved = [t for t in auto_candidates if matches(t)]
+    if resolved:
+        if normalized:
+            print(
+                f"Requested LoRA targets {normalized} not found on model type {model_type}; "
+                f"using detected targets {resolved}."
+            )
+        else:
+            print(f"Using auto-detected LoRA targets for {model_type or 'model'}: {resolved}")
+        return resolved
+
+    for candidate in COMMON_LORA_CANDIDATES:
+        if candidate not in auto_candidates:
+            auto_candidates.append(candidate)
+
+    resolved = [t for t in auto_candidates if matches(t)]
+    if resolved:
+        if normalized:
+            print(
+                f"Requested LoRA targets {normalized} not found on model type {model_type}; "
+                f"using detected targets {resolved}."
+            )
+        else:
+            print(f"Using auto-detected LoRA targets for {model_type or 'model'}: {resolved}")
+        return resolved
+
+    suffix_counts = Counter(name.split(".")[-1] for name in module_names)
+    frequent = [name for name, count in suffix_counts.items() if count > 1]
+    if frequent:
+        fallback = frequent[:4]
+        print(
+            "No matching LoRA targets found; falling back to frequent module names: "
+            f"{fallback}. Override with --lora-target-modules if needed."
+        )
+        return fallback
+
+    raise ValueError(
+        "Unable to determine LoRA target modules for this model. "
+        f"Available modules include: {module_names[:10]}"
+    )
 
 
 class TweetEmbeddingAverager:
@@ -122,6 +276,117 @@ def load_embedding_lookup(vocab_path: Path, embedding_path: Path, scale: float) 
     return TweetEmbeddingAverager(embedding_matrix, vocab, scale=scale)
 
 
+def estimate_embedding_scale(
+    texts: List[str],
+    tokenizer,
+    transformer,
+    embedding_lookup: TweetEmbeddingAverager,
+    max_length: int,
+    device: torch.device,
+    sample_size: int = 2000,
+    batch_size: int = 128,
+) -> float:
+    """Compute avg L2 norms for CLS vs averaged embeddings on a sample."""
+    sample_texts = texts[: sample_size or len(texts)]
+    if not sample_texts:
+        raise ValueError("No texts available to estimate embedding scale.")
+
+    emb_norms = [np.linalg.norm(embedding_lookup(t)) for t in sample_texts]
+    avg_emb_norm = float(np.mean(emb_norms))
+
+    cls_norms: List[float] = []
+    transformer.eval()
+    with torch.no_grad():
+        for start in range(0, len(sample_texts), batch_size):
+            chunk = sample_texts[start : start + batch_size]
+            enc = tokenizer(
+                chunk,
+                truncation=True,
+                padding=True,
+                max_length=max_length,
+                return_tensors="pt",
+            ).to(device)
+            outputs = transformer(**enc)
+            cls_vec = outputs.last_hidden_state[:, 0]
+            cls_norms.extend(cls_vec.norm(dim=1).cpu().tolist())
+    avg_cls_norm = float(np.mean(cls_norms))
+
+    if avg_emb_norm == 0.0:
+        raise ValueError("Average embedding norm is zero; cannot estimate scale.")
+
+    suggested = avg_cls_norm / avg_emb_norm
+    print(
+        f"Estimated embedding scale: avg_cls_norm={avg_cls_norm:.4f}, "
+        f"avg_emb_norm={avg_emb_norm:.4f}, suggested_scale={suggested:.4f}"
+    )
+    return suggested
+
+
+def apply_lora_adapters(
+    model,
+    target_modules: List[str],
+    r: int,
+    alpha: float,
+    dropout: float,
+    task_type: str,
+):
+    if get_peft_model is None or LoraConfig is None or TaskType is None:
+        raise ImportError("peft is required for --use-lora. Install with `pip install peft`.")
+    task_enum = getattr(TaskType, task_type)
+    resolved_targets = resolve_lora_targets(model, target_modules)
+    config = LoraConfig(
+        r=r,
+        lora_alpha=alpha,
+        lora_dropout=dropout,
+        target_modules=resolved_targets,
+        bias="none",
+        task_type=task_enum,
+    )
+    return get_peft_model(model, config)
+
+
+def set_trainable_with_backbone(
+    model,
+    backbone_keywords: List[str],
+    freeze_backbone: bool,
+    use_lora: bool,
+) -> None:
+    """Freeze backbone params if requested; keep head and LoRA adapters trainable."""
+    for name, param in model.named_parameters():
+        in_backbone = any(key in name for key in backbone_keywords)
+        if use_lora and "lora_" in name:
+            param.requires_grad = True
+        elif freeze_backbone and in_backbone:
+            param.requires_grad = False
+        else:
+            param.requires_grad = True
+
+
+def detect_backbone_keywords(model) -> List[str]:
+    candidates = [
+        "bert",
+        "roberta",
+        "distilbert",
+        "camembert",
+        "albert",
+        "xlm_roberta",
+        "electra",
+        "deberta",
+        "deberta_v2",
+        "longformer",
+        "xlnet",
+        "mpnet",
+        "transformer",
+    ]
+    found: List[str] = []
+    for attr in candidates:
+        if hasattr(model, attr):
+            found.append(attr)
+    if not found:
+        found.append("transformer")
+    return found
+
+
 class HybridCollator:
     """Pad token inputs and stack auxiliary averaged embeddings when provided."""
 
@@ -141,9 +406,16 @@ class HybridCollator:
 class HybridTransformerClassifier(nn.Module):
     """Transformer encoder with optional averaged word embeddings fused into the classifier."""
 
-    def __init__(self, model_name: str, num_labels: int, extra_dim: int = 0, dropout: float | None = None) -> None:
+    def __init__(
+        self,
+        model_name: str,
+        num_labels: int,
+        extra_dim: int = 0,
+        dropout: float | None = None,
+        transformer_model=None,
+    ) -> None:
         super().__init__()
-        self.transformer = AutoModel.from_pretrained(model_name)
+        self.transformer = transformer_model if transformer_model is not None else AutoModel.from_pretrained(model_name)
         self.extra_dim = extra_dim
 
         hidden_size = self.transformer.config.hidden_size
@@ -371,23 +643,75 @@ def main() -> None:
     if embedding_lookup is not None:
         print(f"Enabling averaged word embeddings (dim={embedding_lookup.dim}) for fusion with transformer outputs.")
 
+    texts, labels = load_train_data(args.data_dir, args.use_full, args.limit_per_class)
     tokenizer = AutoTokenizer.from_pretrained(args.model_name, use_fast=True)
-    model = (
-        HybridTransformerClassifier(
+    lora_targets = [t.strip() for t in args.lora_target_modules.split(",") if t.strip()]
+    base_transformer = None
+    if embedding_lookup is not None:
+        base_transformer = AutoModel.from_pretrained(args.model_name)
+        if args.use_lora:
+            base_transformer = apply_lora_adapters(
+                base_transformer,
+                lora_targets,
+                r=args.lora_r,
+                alpha=args.lora_alpha,
+                dropout=args.lora_dropout,
+                task_type="FEATURE_EXTRACTION",
+            )
+        base_transformer.to(device)
+
+    if args.estimate_embedding_scale:
+        if embedding_lookup is None:
+            raise ValueError("--estimate-embedding-scale requires --embedding-path and --embedding-vocab.")
+        print(
+            f"Estimating embedding scale using {min(len(texts), args.estimate_sample_size)} samples "
+            f"(max_length={args.max_length})..."
+        )
+        suggested = estimate_embedding_scale(
+            texts,
+            tokenizer,
+            base_transformer,
+            embedding_lookup,
+            args.max_length,
+            device,
+            sample_size=args.estimate_sample_size,
+        )
+        args.embedding_scale = suggested
+        embedding_lookup.scale = suggested
+        print(f"Applied suggested embedding scale: {suggested:.4f}")
+
+    if embedding_lookup is not None:
+        model = HybridTransformerClassifier(
             args.model_name,
             num_labels=2,
             extra_dim=embedding_lookup.dim,
             dropout=args.fusion_dropout,
+            transformer_model=base_transformer,
         )
-        if embedding_lookup is not None
-        else AutoModelForSequenceClassification.from_pretrained(
+    else:
+        model = AutoModelForSequenceClassification.from_pretrained(
             args.model_name,
             num_labels=2,
         )
-    )
+        if args.use_lora:
+            model = apply_lora_adapters(
+                model,
+                lora_targets,
+                r=args.lora_r,
+                alpha=args.lora_alpha,
+                dropout=args.lora_dropout,
+                task_type="SEQ_CLS",
+            )
     model.to(device)
 
-    texts, labels = load_train_data(args.data_dir, args.use_full, args.limit_per_class)
+    backbone_keys = ["transformer"] if isinstance(model, HybridTransformerClassifier) else detect_backbone_keywords(model)
+    set_trainable_with_backbone(
+        model,
+        backbone_keys,
+        freeze_backbone=args.freeze_encoder or args.use_lora,
+        use_lora=args.use_lora,
+    )
+
     train_ds, val_ds = build_datasets(
         tokenizer,
         texts,
@@ -432,11 +756,11 @@ def main() -> None:
     no_decay = ["bias", "LayerNorm.weight", "LayerNorm.bias"]
     optimizer_grouped_parameters = [
         {
-            "params": [p for n, p in model.named_parameters() if not any(nd in n for nd in no_decay)],
+            "params": [p for n, p in model.named_parameters() if p.requires_grad and not any(nd in n for nd in no_decay)],
             "weight_decay": args.weight_decay,
         },
         {
-            "params": [p for n, p in model.named_parameters() if any(nd in n for nd in no_decay)],
+            "params": [p for n, p in model.named_parameters() if p.requires_grad and any(nd in n for nd in no_decay)],
             "weight_decay": 0.0,
         },
     ]
@@ -462,9 +786,23 @@ def main() -> None:
     )
     scheduler = (
         torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=total_steps, eta_min=args.eta_min)
-        if args.use_cosine_scheduler
+        if args.use_cosine_scheduler and not args.use_linear_scheduler
         else None
     )
+    if args.use_linear_scheduler and args.use_cosine_scheduler:
+        raise ValueError("Choose either cosine or linear LR scheduler, not both.")
+    if args.use_linear_scheduler:
+        warmup_steps = max(args.lr_warmup_steps, 0)
+
+        def lr_lambda(step: int):
+            if total_steps <= 0:
+                return 1.0
+            if step < warmup_steps and warmup_steps > 0:
+                return float(step + 1) / float(warmup_steps)
+            progress = (step - warmup_steps) / float(max(1, total_steps - warmup_steps))
+            return max(0.0, 1.0 - progress)
+
+        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
 
     use_amp = False  # AMP disabled per request
     scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
@@ -524,6 +862,12 @@ def main() -> None:
             if global_step > 0 and global_step % args.logging_steps == 0:
                 avg_loss = running_loss / (step * train_loader.batch_size)
                 print(f"[epoch {epoch} step {global_step}] train loss {avg_loss:.4f}")
+
+            if args.eval_steps and global_step > 0 and global_step % args.eval_steps == 0:
+                eval_model = swa_model if use_swa and global_step >= swa_start_step else model
+                val_loss, val_acc = evaluate(eval_model, val_loader, device)
+                print(f"[epoch {epoch} step {global_step}] interim val loss {val_loss:.4f} acc {val_acc:.4f}")
+                model.train()
 
         # Choose model to evaluate (SWA if active)
         eval_model = swa_model if use_swa and global_step >= swa_start_step else model
