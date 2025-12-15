@@ -15,23 +15,30 @@ if [[ ! -f "$VOCAB_PATH" ]]; then
   exit 1
 fi
 
-python distilbert_classifier.py --use-full --device cuda --epochs 2 \
+python distilbert_classifier.py --use-full --device cuda --epochs 3 \
   --model-name vinai/bertweet-base \
-   --use-lora --freeze-encoder \
-  --lora-target-modules 'auto' \
+  --freeze-encoder \
   --val-size 0.05 --metric accuracy --patience 2 --min-delta 0.001 \
   --per-device-train-batch-size 256 --per-device-eval-batch-size 256 \
-  --lr 5e-5 --weight-decay 0.01 --betas 0.9 0.999 0.9999 --alpha-mix 2.0 \
+  --lr 1e-3 --weight-decay 0.001 --betas 0.9 0.999 0.9999 --alpha-mix 8.0 \
   --beta3-warmup 2000 --alpha-warmup 2000 \
   --gradient-accumulation-steps 2 \
-  --output baseline_submission_distilbert.csv \
-  --embedding-path "$EMB_PATH" --embedding-vocab "$VOCAB_PATH" \
+  --output baseline_submission_distilbert_head.csv \
   --eval-steps 500 \
-  # --fusion-dropout 0.1 \
-    # --use-linear-scheduler --lr-warmup-steps 1000 \
-  # --estimate-embedding-scale --estimate-sample-size 10000 \
-  # --use-linear-scheduler --lr-warmup-steps 1000 \
-  # --embedding-path "$EMB_PATH" --embedding-vocab "$VOCAB_PATH" \
-  # --estimate-embedding-scale --estimate-sample-size 2000 \
-  
-  # --use-swa --swa-start-epoch 1 --swa-freq 300 --swa-lr 2e-5 \
+  --embedding-path "$EMB_PATH" --embedding-vocab "$VOCAB_PATH" \
+  --estimate-embedding-scale --estimate-sample-size 10000 \
+  # --demojize-emojis \
+  # --min-clean-tokens 3 \
+  # --outlier-url-mention-ratio 0.7 \
+  # --outlier-allcaps-ratio 0.9 \
+  # --augment-prob 0.05 --augment-max-per-class 50000 \
+  # --imbalance-threshold 1.1
+
+# Optional extras:
+#  --max-clean-tokens 80 \
+#  --use-lora \
+#  --lora-target-modules 'auto' \
+#  --lora-r 32 --lora-alpha 16 --lora-dropout 0.05 \
+#  --fusion-dropout 0.1 \
+#  --use-linear-scheduler --lr-warmup-steps 1000 \
+#  --use-swa --swa-start-epoch 1 --swa-freq 300 --swa-lr 2e-5 \

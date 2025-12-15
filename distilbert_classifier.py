@@ -3,10 +3,12 @@ from __future__ import annotations
 import argparse
 import random
 import pickle
+import html
+import re
 from collections import Counter
 from pathlib import Path
 import math
-from typing import Dict, Iterable, List, Tuple
+from typing import Callable, Dict, Iterable, List, Tuple
 
 import numpy as np
 import torch
@@ -38,6 +40,11 @@ try:
 except ImportError:
     Conv1D = None
 
+try:
+    import emoji
+except ImportError:
+    emoji = None
+
 from ademamix import AdEMAMix, alpha_scheduler, beta3_scheduler
 
 COMMON_LORA_CANDIDATES = [
@@ -58,6 +65,12 @@ COMMON_LORA_CANDIDATES = [
     "in_proj",
     "Wqkv",
 ]
+
+ZERO_WIDTH_RE = re.compile(r"[\u200b-\u200f\u202a-\u202e\u2060\u2063]")
+REPEATED_ALPHA_RE = re.compile(r"([A-Za-z])\1{2,}")
+REPEATED_PUNCT_RE = re.compile(r"([!?.,])\1{2,}")
+HASHTAG_SPLIT_RE = re.compile(r"[A-Z]?[a-z]+|[A-Z]+(?=[A-Z]|$)|\d+")
+DEMOJI_RE = re.compile(r":([a-z0-9_+\-]+):")
 
 DEFAULT_DATA_DIR = Path("data/twitter-datasets")
 
@@ -151,6 +164,53 @@ def parse_args() -> argparse.Namespace:
             "use 'auto' to pick sensible defaults for the chosen backbone."
         ),
     )
+    parser.add_argument(
+        "--min-clean-tokens",
+        type=int,
+        default=2,
+        help="Drop tweets with fewer cleaned tokens than this (after preprocessing).",
+    )
+    parser.add_argument(
+        "--max-clean-tokens",
+        type=int,
+        default=0,
+        help="Truncate cleaned tokens to first/last N when above this length (0 disables).",
+    )
+    parser.add_argument(
+        "--demojize-emojis",
+        action="store_true",
+        help="Convert emojis to textual tokens (requires emoji package) before tokenization.",
+    )
+    parser.add_argument(
+        "--outlier-url-mention-ratio",
+        type=float,
+        default=0.65,
+        help="Drop tweets when (@user+http) density exceeds this ratio (set <=0 to disable).",
+    )
+    parser.add_argument(
+        "--outlier-allcaps-ratio",
+        type=float,
+        default=0.9,
+        help="Drop short tweets with uppercase letter ratio above this threshold (set <=0 to disable).",
+    )
+    parser.add_argument(
+        "--augment-prob",
+        type=float,
+        default=0.0,
+        help="Probability to add a lightly augmented copy of each training tweet (0 disables).",
+    )
+    parser.add_argument(
+        "--augment-max-per-class",
+        type=int,
+        default=0,
+        help="Cap augmented samples per class; 0 means no cap when augmentation is enabled.",
+    )
+    parser.add_argument(
+        "--imbalance-threshold",
+        type=float,
+        default=1.1,
+        help="Apply class weights when the max/min class ratio exceeds this threshold after cleaning.",
+    )
     return parser.parse_args()
 
 
@@ -239,6 +299,28 @@ def resolve_lora_targets(model, requested_targets: List[str] | None) -> List[str
         "Unable to determine LoRA target modules for this model. "
         f"Available modules include: {module_names[:10]}"
     )
+
+
+def split_hashtag(token: str) -> List[str]:
+    body = token[1:] if token.startswith("#") else token
+    parts = HASHTAG_SPLIT_RE.findall(body)
+    return parts if parts else [body]
+
+
+def normalize_repetitions(token: str) -> str:
+    token = REPEATED_ALPHA_RE.sub(r"\1\1", token)
+    token = REPEATED_PUNCT_RE.sub(r"\1\1", token)
+    return token
+
+
+def demojize_text(text: str) -> str:
+    if emoji is None:
+        return text
+    try:
+        demojized = emoji.demojize(text, language="en")
+    except TypeError:
+        demojized = emoji.demojize(text)
+    return DEMOJI_RE.sub(r" \1 ", demojized)
 
 
 class TweetEmbeddingAverager:
@@ -464,44 +546,115 @@ class HybridTransformerClassifier(nn.Module):
         return SequenceClassifierOutput(logits=logits, loss=loss)
 
 
-def preprocess_tweet(text: str) -> str:
-    tokens = []
-    for tok in text.split():
-        if tok.startswith("@") and len(tok) > 1:
-            tokens.append("@user")
-        elif tok.startswith("http"):
-            tokens.append("http")
-        else:
-            tokens.append(tok)
+def preprocess_tweet(
+    text: str,
+    *,
+    min_tokens: int = 0,
+    max_tokens: int = 0,
+    demojize_emojis: bool = False,
+    url_mention_ratio: float = 0.0,
+    allcaps_ratio: float = 0.0,
+) -> str | None:
+    """
+    Normalize tweet text with placeholder mapping, hashtag splitting, emoji text conversion,
+    repetition collapse, HTML unescape, and light outlier filtering.
+    Returns cleaned text or None if filtered out.
+    """
+    cleaned = html.unescape(text)
+    cleaned = ZERO_WIDTH_RE.sub("", cleaned).replace("\ufeff", "").strip()
+    cleaned = re.sub(r"^rt\s+", "", cleaned, flags=re.IGNORECASE)
+    if demojize_emojis:
+        cleaned = demojize_text(cleaned)
+
+    tokens: List[str] = []
+    for raw_tok in cleaned.split():
+        parts = split_hashtag(raw_tok) if raw_tok.startswith("#") else [raw_tok]
+        for part in parts:
+            lowered = normalize_repetitions(part.lower().strip())
+            lowered = lowered.replace("_", " ")
+            for tok in lowered.split():
+                if not tok:
+                    continue
+                if tok.startswith("@") and len(tok) > 1:
+                    tokens.append("@user")
+                elif tok.startswith("http"):
+                    tokens.append("http")
+                else:
+                    tokens.append(tok)
+
+    if not tokens:
+        return None
+
+    num_alpha = sum(ch.isalpha() for ch in text)
+    upper_ratio = (sum(ch.isupper() for ch in text) / num_alpha) if num_alpha else 0.0
+    if allcaps_ratio > 0 and upper_ratio >= allcaps_ratio and len(tokens) <= 4:
+        return None
+
+    url_mentions = sum(1 for t in tokens if t in {"http", "@user"})
+    density = url_mentions / len(tokens)
+    if url_mention_ratio > 0 and density >= url_mention_ratio and len(tokens) > 4:
+        return None
+
+    if min_tokens and len(tokens) < min_tokens:
+        return None
+
+    if max_tokens and len(tokens) > max_tokens:
+        keep_first = max_tokens // 2
+        keep_last = max_tokens - keep_first
+        tokens = tokens[:keep_first] + tokens[-keep_last:]
+
     return " ".join(tokens)
 
 
-def read_labeled(path: Path, label: int, limit: int | None) -> Tuple[List[str], List[int]]:
+def read_labeled(
+    path: Path,
+    label: int,
+    limit: int | None,
+    preprocess_fn: Callable[[str], str | None],
+) -> Tuple[List[str], List[int], int]:
     texts: List[str] = []
     labels: List[int] = []
+    dropped = 0
     with path.open("r", encoding="utf-8") as handle:
         for idx, line in enumerate(handle):
             if limit is not None and idx >= limit:
                 break
             cleaned = line.strip()
-            if cleaned:
-                texts.append(preprocess_tweet(cleaned))
-                labels.append(label)
-    return texts, labels
+            if not cleaned:
+                continue
+            processed = preprocess_fn(cleaned)
+            if processed is None:
+                dropped += 1
+                continue
+            texts.append(processed)
+            labels.append(label)
+    return texts, labels, dropped
 
 
-def load_train_data(data_dir: Path, use_full: bool, limit_per_class: int | None) -> Tuple[List[str], List[int]]:
+def load_train_data(
+    data_dir: Path,
+    use_full: bool,
+    limit_per_class: int | None,
+    preprocess_fn: Callable[[str], str | None],
+) -> Tuple[List[str], List[int], dict]:
     pos_file = data_dir / ("train_pos_full.txt" if use_full else "train_pos.txt")
     neg_file = data_dir / ("train_neg_full.txt" if use_full else "train_neg.txt")
-    pos_texts, pos_labels = read_labeled(pos_file, 1, limit_per_class)
-    neg_texts, neg_labels = read_labeled(neg_file, 0, limit_per_class)
+    pos_texts, pos_labels, pos_dropped = read_labeled(pos_file, 1, limit_per_class, preprocess_fn)
+    neg_texts, neg_labels, neg_dropped = read_labeled(neg_file, 0, limit_per_class, preprocess_fn)
     texts = pos_texts + neg_texts
     labels = pos_labels + neg_labels
-    print(f"Loaded {len(texts)} train tweets (pos: {len(pos_texts)}, neg: {len(neg_texts)}).")
-    return texts, labels
+    dropped = {"pos": pos_dropped, "neg": neg_dropped}
+    print(
+        f"Loaded {len(texts)} train tweets (pos: {len(pos_texts)}, neg: {len(neg_texts)}); "
+        f"dropped after cleaning (pos: {pos_dropped}, neg: {neg_dropped})."
+    )
+    return texts, labels, dropped
 
 
-def load_test_data(path: Path) -> Tuple[List[int], List[str]]:
+def load_test_data(
+    path: Path,
+    preprocess_fn: Callable[[str], str | None],
+) -> Tuple[List[int], List[str]]:
     ids: List[int] = []
     texts: List[str] = []
     with path.open("r", encoding="utf-8") as handle:
@@ -511,9 +664,70 @@ def load_test_data(path: Path) -> Tuple[List[int], List[str]]:
                 continue
             id_str, tweet = cleaned.split(",", 1)
             ids.append(int(id_str))
-            texts.append(preprocess_tweet(tweet.strip()))
+            processed = preprocess_fn(tweet.strip())
+            if processed is None:
+                processed = ""
+            texts.append(processed)
     print(f"Loaded {len(ids)} test tweets from {path}.")
     return ids, texts
+
+
+def synonym_augment(text: str) -> str | None:
+    """Lightweight synonym replacement on a few sentiment-bearing words."""
+    synonym_bank = {
+        "good": ["great", "nice", "positive", "pleasant"],
+        "great": ["excellent", "wonderful"],
+        "love": ["enjoy", "like", "adore"],
+        "amazing": ["fantastic", "awesome"],
+        "bad": ["terrible", "awful", "poor"],
+        "sad": ["unhappy", "down"],
+        "hate": ["dislike", "detest"],
+        "angry": ["mad", "upset"],
+        "happy": ["glad", "cheerful"],
+        "disappointed": ["let down", "dissatisfied"],
+    }
+    tokens = text.split()
+    new_tokens: List[str] = []
+    changed = False
+    for tok in tokens:
+        base = tok.lower()
+        if base in synonym_bank and random.random() < 0.3:
+            replacement = random.choice(synonym_bank[base])
+            new_tokens.append(replacement)
+            changed = True
+        else:
+            new_tokens.append(tok)
+    if not changed:
+        return None
+    return " ".join(new_tokens)
+
+
+def augment_dataset(
+    texts: List[str],
+    labels: List[int],
+    prob: float,
+    max_per_class: int,
+) -> Tuple[List[str], List[int], int]:
+    if prob <= 0.0:
+        return texts, labels, 0
+
+    per_class_added = Counter()
+    augmented = 0
+    new_texts = list(texts)
+    new_labels = list(labels)
+    for text, label in zip(texts, labels):
+        if random.random() >= prob:
+            continue
+        if max_per_class and per_class_added[label] >= max_per_class:
+            continue
+        augmented_text = synonym_augment(text)
+        if augmented_text is None:
+            continue
+        new_texts.append(augmented_text)
+        new_labels.append(label)
+        per_class_added[label] += 1
+        augmented += 1
+    return new_texts, new_labels, augmented
 
 
 def build_datasets(
@@ -584,9 +798,9 @@ def write_submission(ids: Iterable[int], preds: Iterable[int], output_path: Path
     print(f"Wrote predictions to {output_path.resolve()}")
 
 
-def evaluate(model, loader: DataLoader, device: torch.device):
+def evaluate(model, loader: DataLoader, device: torch.device, loss_fn=None):
     model.eval()
-    loss_fn = torch.nn.CrossEntropyLoss()
+    loss_fn = loss_fn if loss_fn is not None else torch.nn.CrossEntropyLoss()
     total_loss = 0.0
     total_correct = 0
     total_seen = 0
@@ -643,7 +857,36 @@ def main() -> None:
     if embedding_lookup is not None:
         print(f"Enabling averaged word embeddings (dim={embedding_lookup.dim}) for fusion with transformer outputs.")
 
-    texts, labels = load_train_data(args.data_dir, args.use_full, args.limit_per_class)
+    preprocess_fn = lambda txt: preprocess_tweet(
+        txt,
+        min_tokens=args.min_clean_tokens,
+        max_tokens=args.max_clean_tokens,
+        demojize_emojis=args.demojize_emojis,
+        url_mention_ratio=args.outlier_url_mention_ratio,
+        allcaps_ratio=args.outlier_allcaps_ratio,
+    )
+
+    texts, labels, dropped = load_train_data(args.data_dir, args.use_full, args.limit_per_class, preprocess_fn)
+
+    if args.augment_prob > 0.0:
+        texts, labels, added = augment_dataset(texts, labels, args.augment_prob, args.augment_max_per_class)
+        if added:
+            print(f"Augmented training set with {added} synthetic samples (prob={args.augment_prob}).")
+
+    label_counts = Counter(labels)
+    if len(label_counts) < 2:
+        raise ValueError("Training data must contain at least two classes after preprocessing.")
+    imbalance_ratio = max(label_counts.values()) / max(1, min(label_counts.values()))
+    class_weights = None
+    if imbalance_ratio >= args.imbalance_threshold:
+        total = sum(label_counts.values())
+        num_classes = len(label_counts)
+        weight_vals = [total / (num_classes * label_counts[i]) for i in sorted(label_counts)]
+        class_weights = torch.tensor(weight_vals, dtype=torch.float32)
+        print(f"Applying class weights due to imbalance ratio {imbalance_ratio:.3f}: {weight_vals}")
+    else:
+        print(f"Class distribution after cleaning/augment: {dict(label_counts)} (imbalance ratio {imbalance_ratio:.3f})")
+
     tokenizer = AutoTokenizer.from_pretrained(args.model_name, use_fast=True)
     lora_targets = [t.strip() for t in args.lora_target_modules.split(",") if t.strip()]
     base_transformer = None
@@ -704,6 +947,9 @@ def main() -> None:
             )
     model.to(device)
 
+    if class_weights is not None:
+        class_weights = class_weights.to(device)
+
     backbone_keys = ["transformer"] if isinstance(model, HybridTransformerClassifier) else detect_backbone_keywords(model)
     set_trainable_with_backbone(
         model,
@@ -722,7 +968,7 @@ def main() -> None:
         embedding_lookup=embedding_lookup,
     )
 
-    test_ids, test_texts = load_test_data(args.data_dir / "test_data.txt")
+    test_ids, test_texts = load_test_data(args.data_dir / "test_data.txt", preprocess_fn)
     test_ds = build_test_dataset(tokenizer, test_texts, args.max_length, embedding_lookup=embedding_lookup)
 
     # Prepare torch datasets/dataloaders
@@ -816,7 +1062,7 @@ def main() -> None:
         else None
     )
 
-    loss_fn = torch.nn.CrossEntropyLoss()
+    loss_fn = torch.nn.CrossEntropyLoss(weight=class_weights)
     best_metric = None
     best_state = None
     best_epoch = 0
@@ -865,13 +1111,13 @@ def main() -> None:
 
             if args.eval_steps and global_step > 0 and global_step % args.eval_steps == 0:
                 eval_model = swa_model if use_swa and global_step >= swa_start_step else model
-                val_loss, val_acc = evaluate(eval_model, val_loader, device)
+                val_loss, val_acc = evaluate(eval_model, val_loader, device, loss_fn=loss_fn)
                 print(f"[epoch {epoch} step {global_step}] interim val loss {val_loss:.4f} acc {val_acc:.4f}")
                 model.train()
 
         # Choose model to evaluate (SWA if active)
         eval_model = swa_model if use_swa and global_step >= swa_start_step else model
-        val_loss, val_acc = evaluate(eval_model, val_loader, device)
+        val_loss, val_acc = evaluate(eval_model, val_loader, device, loss_fn=loss_fn)
         print(f"[epoch {epoch}/{args.epochs}] val loss {val_loss:.4f} acc {val_acc:.4f}")
 
         if use_swa and global_step >= swa_start_step:
