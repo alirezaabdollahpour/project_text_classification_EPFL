@@ -1,0 +1,10 @@
+We address tweet sentiment classification in the EPFL ML text challenge. The dataset provides weak supervision from emoticons that were removed during preprocessing: tweets in \texttt{train\_pos*.txt} originally contained a positive \texttt{:)}, and tweets in \texttt{train\_neg*.txt} a negative \texttt{:(}. Given only the remaining text, we predict sentiment for 10{,}000 unlabeled test tweets (\texttt{test\_data.txt}). This setting is challenging due to informal language, creative spelling, hashtags, and heavy use of URLs and mentions.
+
+Our report follows an incremental modeling approach. We begin with strong, fast baselines based on feature hashing and embedding-bag pooling. We then learn in-domain word representations by training GloVe embeddings on tweet co-occurrences, and finally fine-tune a transformer pretrained on tweets (BERTweet). To combine complementary signals, we optionally fuse averaged GloVe embeddings with the transformer representation prior to classification.
+
+\paragraph{Contributions.} We provide:
+\begin{itemize}
+  \item a set of reproducible baseline systems (hashed n-grams; embedding-bag mean pooling) for rapid iteration;
+  \item an in-domain GloVe pipeline and a hybrid fusion model that mixes averaged GloVe with transformer features;
+  \item an evaluation protocol based on local stratified validation splits, plus ablations for preprocessing and modeling choices.
+\end{itemize}

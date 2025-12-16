@@ -1,0 +1,10 @@
+\subsection{From sparse features to distributional representations}
+Early sentiment systems often relied on sparse lexical features (e.g., unigrams/bigrams). Feature hashing \citep{weinberger2009featurehashing} provides a simple, memory-efficient way to map such features into a fixed-dimensional space, and remains a strong baseline when paired with linear models.
+
+Distributional word representations such as GloVe \citep{pennington2014glove} encode semantic and syntactic regularities and can improve generalization over sparse counts. A common approach for short texts is to represent an input by pooling (e.g., averaging) its word vectors and training a linear or shallow neural classifier on top.
+
+\subsection{Transformers and tweet-specific pretraining}
+Transformers \citep{vaswani2017attention} and large-scale pretraining (e.g., BERT \citep{devlin2019bert}) substantially improved text classification by learning contextual representations. For tweets, domain mismatch matters: BERTweet \citep{nguyen2020bertweet} is pretrained specifically on English Twitter data, making it a strong choice for sentiment tasks with informal language and platform-specific tokens.
+
+\subsection{Efficient adaptation and training stabilization}
+When full fine-tuning is expensive, parameter-efficient adaptation methods like LoRA \citep{hu2021lora} update low-rank adapters instead of all weights. Separately, stochastic weight averaging (SWA) \citep{izmailov2018swa} can improve generalization by averaging weights along the training trajectory. Our codebase includes optional support for both ideas in the transformer pipeline.

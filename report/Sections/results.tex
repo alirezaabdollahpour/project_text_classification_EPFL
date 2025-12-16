@@ -1,0 +1,23 @@
+\subsection{Main results}
+Table~\ref{tab:main-results} summarizes our local validation performance across model families. We report both accuracy and misclassification error to match the AIcrowd evaluation metric. (Fill in the numbers from your final runs.)
+
+\begin{table}[t]
+\centering
+\small
+\begin{tabular}{lcc}
+\toprule
+\textbf{Model} & \textbf{Val Acc} $\uparrow$ & \textbf{Val Err} $\downarrow$ \\
+\midrule
+Hashed n-gram baseline & \_\_\_ & \_\_\_ \\
+Embedding-bag (frozen) & \_\_\_ & \_\_\_ \\
++ GloVe pooled features & \_\_\_ & \_\_\_ \\
+BERTweet fine-tuning & \_\_\_ & \_\_\_ \\
+BERTweet + GloVe fusion & \_\_\_ & \_\_\_ \\
+\bottomrule
+\end{tabular}
+\caption{Local validation results. Replace placeholders with your final numbers.}
+\label{tab:main-results}
+\end{table}
+
+\subsection{Ablations}
+We recommend reporting ablations that isolate the contributions of (i) tweet cleaning flags, (ii) fusion vs.\ no fusion, (iii) freezing encoder vs.\ LoRA/full fine-tuning, and (iv) optimization choices (scheduler, SWA). A compact ablation table is often the most convincing way to justify design decisions.

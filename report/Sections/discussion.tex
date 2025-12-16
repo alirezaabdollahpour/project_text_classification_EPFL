@@ -1,0 +1,8 @@
+\subsection{What worked and why}
+In this task, domain mismatch is a primary failure mode: models pretrained on generic corpora can underperform on tweets due to slang, hashtags, and platform-specific tokens. Tweet-pretrained encoders such as BERTweet help mitigate this gap, and hybridizing transformer features with averaged in-domain embeddings can further stabilize performance when tweets are short or noisy.
+
+\subsection{Limitations}
+Our evaluation relies on a single stratified validation split unless cross-validation is used; results can vary with the split and random seed. Additionally, leaderboard-driven iteration risks overfitting to the public test feedback; we therefore prioritize local validation when selecting hyperparameters.
+
+\subsection{Ethical considerations}
+Although this is an academic benchmark, sentiment systems may be used downstream for moderation or decision-making. Misclassifications can disproportionately affect groups whose language use differs from the dominant training distribution (dialect, slang, code-switching). We recommend documenting known failure cases, avoiding deployment without stakeholder review, and considering bias/robustness checks where possible.
