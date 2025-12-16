@@ -1,0 +1,163 @@
+\documentclass[10pt]{article}
+
+% ---- Page + typography (aim for 4 pages total) ----
+\usepackage[margin=1in]{geometry}
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage{lmodern}
+\usepackage{microtype}
+\usepackage{parskip}
+\setlength{\parskip}{4pt}
+\setlength{\parindent}{0pt}
+
+% ---- Math, tables, figures ----
+\usepackage{amsmath, amssymb}
+\usepackage{booktabs}
+\usepackage{multirow}
+\usepackage{siunitx}
+\usepackage{graphicx}
+\usepackage{subcaption}
+\usepackage{float}
+\usepackage{caption}
+\captionsetup{font=small}
+
+% ---- Links + references ----
+\usepackage[hidelinks]{hyperref}
+\usepackage{natbib}
+\bibliographystyle{plainnat}
+
+% ---- Convenience macros ----
+\newcommand{\task}{EPFL ML Project 2: Tweet Sentiment Classification}
+\newcommand{\dataset}{Twitter-datasets (train\_pos/neg, test\_data)}
+\newcommand{\metric}{classification error / accuracy}
+
+\title{\vspace{-0.6em}\textbf{Hybrid BERTweet with Averaged GloVe Fusion for Smiley-Based Tweet Sentiment Classification}\\
+\large \task}
+\author{
+Author 1 (\texttt{author1@epfl.ch}) \and
+Author 2 (\texttt{author2@epfl.ch}) \and
+Author 3 (\texttt{author3@epfl.ch})
+}
+\date{}
+
+\begin{document}
+\maketitle
+\vspace{-1.0em}
+
+\begin{abstract}
+Briefly state the task, your main idea, and the key quantitative result (e.g., validation error and/or AIcrowd score).
+Keep it \textbf{short} (5--8 lines).
+\end{abstract}
+
+\vspace{-0.5em}
+\section{Introduction}
+We address the EPFL tweet sentiment task, where labels are derived from removed smileys: tweets in \texttt{train\_pos*.txt} originally contained a positive \texttt{:)}, and tweets in \texttt{train\_neg*.txt} contained a negative \texttt{:(}. Given only the remaining text (already whitespace-tokenized), the goal is to predict the sentiment of \texttt{test\_data.txt} (10{,}000 unlabeled tweets). This setting is challenging due to informal language, slang, creative spelling, hashtags, and heavy use of mentions/URLs, which can add noise and distribution shift.
+
+Our approach progresses from lightweight baselines to a tweet-pretrained transformer. We start with strong, reproducible baselines based on (i) the hashing trick with unigram/bigram features and (ii) embedding-bag mean pooling over a vocabulary. We then leverage distributional representations by training GloVe embeddings \citep{pennington2014glove} on the tweet corpus, and finally fine-tune a transformer pretrained on tweets (BERTweet \citep{nguyen2020bertweet}) with a small classification head. To combine complementary signals, we optionally fuse averaged GloVe embeddings with the transformer representation before classification. In all experiments, we rely on a local stratified validation split (or cross-validation) to estimate generalization and avoid overfitting to the leaderboard.
+
+\textbf{Contributions.}
+\begin{itemize}
+  \item A set of strong, fast baselines (hashed n-grams; embedding-bag mean pooling) for reliable iteration.
+  \item A GloVe pipeline to learn in-domain word vectors from tweet co-occurrences.
+  \item A tweet-pretrained transformer classifier (BERTweet) with careful training control (validation split, early stopping), and an optional hybrid fusion with averaged GloVe features.
+  \item A lightweight tweet cleaning procedure (e.g., mention/URL normalization, hashtag splitting, repetition normalization) evaluated via ablations.
+\end{itemize}
+
+\section{Data and Evaluation}
+\textbf{Data.} Summarize \dataset. Mention any preprocessing assumptions (tokens separated by whitespace per provided dataset).
+
+\textbf{Splits.} Explain your validation protocol (holdout split or cross-validation), stratification, random seeds, and whether you use the full training set.
+
+\textbf{Metric.} Report \metric, consistent with AIcrowd evaluation. Always compute local validation metrics to avoid overfitting to the leaderboard.
+
+\section{Methods}
+\subsection{Baseline Models}
+Describe the baseline you started from and why.
+In this repo, a natural baseline is:
+\begin{itemize}
+  \item \textbf{Hashed features:} hashing trick with unigram/bigram indices and a linear head.
+  \item \textbf{Embedding baseline:} embedding-bag (mean pooling) over a fixed vocabulary, optionally with a small MLP head.
+\end{itemize}
+Explain the key hyperparameters (feature dimension, n-grams, max tokens, hidden size, dropout).
+
+\subsection{GloVe Word Embeddings}
+Describe training of GloVe vectors \citep{pennington2014glove} from the tweet corpus.
+Include vocabulary construction, co-occurrence window assumptions, embedding dimension, and optimization choices.
+
+\subsection{Transformer Fine-tuning (DistilBERT)}
+Describe your transformer model \citep{sanh2019distilbert} and fine-tuning setup (max length, batch size, LR, weight decay, epochs).
+If you use LoRA adapters \citep{hu2021lora} or SWA, state exactly how and why.
+If you fuse averaged word embeddings with transformer features, describe the fusion (projection, concatenation, classifier head).
+
+\section{Experiments}
+\subsection{Experimental Setup}
+Provide enough detail for reproducibility:
+\begin{itemize}
+  \item Hardware (CPU/GPU), runtime constraints.
+  \item Software (Python version, key libraries).
+  \item Training details: optimizer, scheduler, early stopping, seed.
+\end{itemize}
+
+\subsection{Results}
+Provide a table with validation results, and (optionally) the AIcrowd score for your best submission.
+
+\begin{table}[H]
+  \centering
+  \small
+  \begin{tabular}{lccc}
+    \toprule
+    \textbf{Model} & \textbf{Val Acc} $\uparrow$ & \textbf{Val Err} $\downarrow$ & \textbf{Notes} \\
+    \midrule
+    Hashed linear baseline &  &  & unigrams/bigrams \\
+    Embedding-bag baseline &  &  & pretrained/frozen \\
+    + GloVe embeddings &  &  & dim=$\cdots$ \\
+    DistilBERT fine-tune &  &  & maxlen=$\cdots$ \\
+    + LoRA / SWA / fusion &  &  & ablations below \\
+    \bottomrule
+  \end{tabular}
+  \caption{Main results on the local validation protocol. Fill in all values.}
+  \label{tab:main-results}
+\end{table}
+
+\subsection{Ablations and Error Analysis}
+Show what mattered:
+\begin{itemize}
+  \item Which preprocessing choices helped/hurt?
+  \item Effect of max length, batch size, LR, LoRA rank, SWA start, embedding fusion scale.
+  \item Analyze typical failure cases (sarcasm, negation, rare slang, URL-heavy tweets).
+\end{itemize}
+
+\section{Ethical Risks (200--400 words)}
+\textbf{This section is required by the project description} (\url{file:///Users/alireza/Code/EPFL/ML/Project02/project2_description.pdf}).
+Discuss stakeholders, potential harms (misclassification, bias, downstream moderation impacts), and mitigation ideas (bias checks, transparency, thresholding, robustness tests).
+Keep it within 200--400 words.
+
+\section{Reproducibility}
+Provide \textbf{exact} commands to reproduce your best submission.
+\textbf{Example (edit to match your final pipeline):}
+\begin{verbatim}
+# (1) Download data
+python3 download_dataset.py
+
+# (2) (Optional) Build GloVe resources
+./build_vocab.sh
+./cut_vocab.sh
+python3 pickle_vocab.py
+python3 cooc.py
+python3 glove_solution.py
+
+# (3) Train model + write submission
+python3 distilbert_classifier.py --use-full --epochs 3 --lr 5e-5 \
+  --max-length 96 --output baseline_submission_distilbert.csv
+\end{verbatim}
+Also list the random seed(s) and where your submission CSV is produced.
+
+\section{Conclusion}
+Summarize what worked, what did not, and one concrete next step.
+
+\vspace{-0.5em}
+\bibliography{refs}
+
+\end{document}
+
+
