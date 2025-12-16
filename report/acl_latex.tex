@@ -116,7 +116,7 @@
 
 
 \begin{abstract}
-We study the EPFL tweet sentiment task where supervision is derived from removed emoticons: tweets in \texttt{train\_pos*.txt} originally contained \texttt{:)}, while \texttt{train\_neg*.txt} contained \texttt{:(}. Given only the remaining, whitespace-tokenized text, the goal is to predict labels for \texttt{test\_data.txt}. We develop a progression of models from fast hashed n-gram and embedding-bag baselines to a tweet-pretrained transformer (BERTweet), and evaluate an optional hybrid that fuses averaged GloVe embeddings with the transformer representation. We emphasize reproducible pipelines, controlled ablations (preprocessing and fusion), and local validation to avoid leaderboard overfitting.
+We study the EPFL tweet sentiment task where supervision is derived from removed emoticons (smiley and sad face): tweets in \texttt{train\_pos*.txt} originally contained \texttt{:)}, while \texttt{train\_neg*.txt} contained \texttt{:(}. Given only the remaining, whitespace-tokenized text, the goal is to predict labels for \texttt{test\_data.txt}. We follow a simple-to-complex progression: hashed n-gram and embedding-bag baselines, pooled in-domain GloVe embeddings, and finally \textbf{pretraining and fine-tuning} with the tweet-pretrained transformer \textbf{BERTweet}. We additionally evaluate an optional fusion module that combines averaged GloVe features with transformer representations. We select hyperparameters via local validation and report leaderboard results for the best configuration.
 \end{abstract}
 
 
@@ -147,9 +147,14 @@ We study the EPFL tweet sentiment task where supervision is derived from removed
 
 \bibliography{bib}
 
+\clearpage
+\onecolumn
 \appendix
 
 \section{Dataset Details}
 \input{Appendix/dataset_details}
+
+\section{Reproducibility}
+\input{Appendix/reproducibility}
 
 \end{document}

@@ -18,19 +18,3 @@ All provided training scripts write a submission CSV with header:
 \texttt{Id,Prediction}
 \end{quote}
 Predictions are mapped to \(\{-1,+1\}\): negative \(\rightarrow -1\), positive \(\rightarrow +1\).
-
-\subsection{Reproduction commands}
-From \texttt{project\_text\_classification\_EPFL/}:
-\begin{verbatim}
-# (Optional) build vocabulary + co-occurrences for GloVe
-./build_vocab.sh
-./cut_vocab.sh
-python3 pickle_vocab.py
-python3 cooc.py
-python3 glove_solution.py
-
-# Example transformer training + submission (see run_distilbert.sh)
-python3 distilbert_classifier.py --use-full --model-name vinai/bertweet-base \
-  --freeze-encoder --val-size 0.05 --epochs 3 \
-  --output baseline_submission_distilbert_head.csv
-\end{verbatim}

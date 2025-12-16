@@ -1,10 +1,11 @@
-We address tweet sentiment classification in the EPFL ML text challenge. The dataset provides weak supervision from emoticons that were removed during preprocessing: tweets in \texttt{train\_pos*.txt} originally contained a positive \texttt{:)}, and tweets in \texttt{train\_neg*.txt} a negative \texttt{:(}. Given only the remaining text, we predict sentiment for 10{,}000 unlabeled test tweets (\texttt{test\_data.txt}). This setting is challenging due to informal language, creative spelling, hashtags, and heavy use of URLs and mentions.
+We address tweet sentiment classification in the EPFL ML text challenge. The dataset provides weak supervision from removed emoticons: tweets in \path{train_pos*.txt} originally contained a positive smiley, and tweets in \path{train_neg*.txt} a negative one. Given only the remaining, whitespace-tokenized text, we predict sentiment for 10{,}000 unlabeled tweets in \path{test_data.txt}. This setting is challenging due to informal language, creative spelling, hashtags, and heavy use of URLs and mentions.
 
-Our report follows an incremental modeling approach. We begin with strong, fast baselines based on feature hashing and embedding-bag pooling. We then learn in-domain word representations by training GloVe embeddings on tweet co-occurrences, and finally fine-tune a transformer pretrained on tweets (BERTweet). To combine complementary signals, we optionally fuse averaged GloVe embeddings with the transformer representation prior to classification.
+Our report follows an incremental modeling approach \textbf{from simple to more complex}. We begin with strong, fast baselines based on feature hashing and embedding-bag pooling to establish a reliable reference point. Next, we add in-domain GloVe embeddings trained on tweet co-occurrences and evaluate pooled embedding classifiers. Finally, we move to \textbf{pretraining and fine-tuning} by fine-tuning a tweet-pretrained transformer (BERTweet) for binary classification, and we optionally explore a hybrid model that fuses the fine-tuned transformer representation with a pooled GloVe vector to improve robustness on short, noisy tweets.
 
-\paragraph{Contributions.} We provide:
+\paragraph{Results.} Our main findings and contributions are:
 \begin{itemize}
-  \item a set of reproducible baseline systems (hashed n-grams; embedding-bag mean pooling) for rapid iteration;
-  \item an in-domain GloVe pipeline and a hybrid fusion model that mixes averaged GloVe with transformer features;
-  \item an evaluation protocol based on local stratified validation splits, plus ablations for preprocessing and modeling choices.
+  \item \textbf{Strong simple baselines:} hashed n-gram and embedding-bag models provide fast, reproducible reference points for iteration.
+  \item \textbf{In-domain embeddings:} we train GloVe on the tweet corpus and show how pooled static embeddings improve over sparse features.
+  \item \textbf{Pretraining + fine-tuning:} fine-tuning tweet-pretrained BERTweet yields our strongest model family under a controlled validation protocol.
+  \item \textbf{Hybrid fusion:} we test whether combining averaged GloVe features with transformer representations improves robustness.
 \end{itemize}

@@ -1,0 +1,39 @@
+\label{sec:reproducibility}
+
+\subsection{Exact commands}
+All experiments and the final submission can be reproduced from the repository root
+(\path{project_text_classification_EPFL/}). Below are the command sequences corresponding to the
+main pipelines.
+
+\paragraph{(Optional) Build GloVe resources.}
+\begin{verbatim}
+./build_vocab.sh
+./cut_vocab.sh
+python3 pickle_vocab.py
+python3 cooc.py
+python3 glove_solution.py
+\end{verbatim}
+
+\paragraph{Baseline classifier (hashed / embedding-bag).}
+\begin{verbatim}
+python3 baseline_classifier.py --use-full --device auto \
+  --representation hash --ngram-max 2 --num-features 262144 \
+  --epochs 5 --batch-size 2048 --output baseline_submission.csv
+\end{verbatim}
+
+\paragraph{BERTweet fine-tuning (+ optional fusion).}
+The recommended configuration used in our runs is documented in \path{run_distilbert.sh}.
+For example (head-only training with optional averaged-embedding fusion):
+\begin{verbatim}
+python3 distilbert_classifier.py --use-full --device cuda \
+  --model-name vinai/bertweet-base --freeze-encoder \
+  --val-size 0.05 --epochs 3 --output baseline_submission_distilbert_head.csv \
+  --embedding-path embeddings.npy --embedding-vocab vocab.pkl \
+  --estimate-embedding-scale
+\end{verbatim}
+
+\subsection{Outputs}
+All scripts write a submission CSV with header \texttt{Id,Prediction}, where predictions are mapped to
+\(\{-1,+1\}\) (negative \(\rightarrow -1\), positive \(\rightarrow +1\)).
+
+
