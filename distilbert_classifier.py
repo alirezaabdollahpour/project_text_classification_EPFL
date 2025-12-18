@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import random
 import pickle
 import html
 import re
+import time
 from collections import Counter
 from pathlib import Path
 import math
@@ -74,6 +76,28 @@ DEMOJI_RE = re.compile(r":([a-z0-9_+\-]+):")
 
 DEFAULT_DATA_DIR = Path("data/twitter-datasets")
 
+METRICS_CSV_FIELDS = [
+    "run_id",
+    "wall_time",
+    "elapsed_sec",
+    "event",
+    "epoch",
+    "step_in_epoch",
+    "global_step",
+    "lr",
+    "swa_active",
+    "eval_model",
+    "grad_norm",
+    "train_loss",
+    "train_acc",
+    "train_samples",
+    "val_loss",
+    "val_acc",
+    "val_samples",
+    "best_metric",
+    "best_epoch",
+]
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Fine-tune DistilBERT for tweet sentiment classification.")
@@ -120,6 +144,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-grad-norm", type=float, default=1.0, help="Gradient clipping max norm (0 to disable).")
     parser.add_argument("--seed", type=int, default=42, help="Random seed.")
     parser.add_argument("--output", type=Path, default=Path("baseline_submission_distilbert.csv"), help="Submission CSV path.")
+    parser.add_argument(
+        "--metrics-csv",
+        type=Path,
+        default=None,
+        help=(
+            "Where to write training/validation metrics as CSV for later plotting. "
+            "Defaults to <output_stem>_metrics.csv next to --output."
+        ),
+    )
     parser.add_argument("--device", type=str, default="auto", help='Device string ("cuda", "cpu", or "auto").')
     parser.add_argument("--patience", type=int, default=2, help="Early stopping patience (epochs without improvement).")
     parser.add_argument("--metric", type=str, choices=["accuracy", "eval_loss"], default="accuracy", help="Metric for best model.")
@@ -221,6 +254,41 @@ def choose_device(name: str) -> torch.device:
         print("CUDA requested but not available; falling back to CPU.")
         return torch.device("cpu")
     return torch.device(name)
+
+
+def get_optimizer_lr(optimizer: torch.optim.Optimizer) -> float:
+    if not optimizer.param_groups:
+        return float("nan")
+    return float(optimizer.param_groups[0].get("lr", float("nan")))
+
+
+class MetricsCSVLogger:
+    def __init__(self, path: Path, run_id: str):
+        self.path = path
+        self.run_id = run_id
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._fp = self.path.open("w", newline="", encoding="utf-8")
+        self._writer = csv.DictWriter(self._fp, fieldnames=METRICS_CSV_FIELDS)
+        self._writer.writeheader()
+        self._fp.flush()
+
+    def log(self, **row) -> None:
+        record = {key: "" for key in METRICS_CSV_FIELDS}
+        record["run_id"] = self.run_id
+        for key, value in row.items():
+            if key not in record:
+                continue
+            if value is None:
+                record[key] = ""
+            elif isinstance(value, bool):
+                record[key] = int(value)
+            else:
+                record[key] = value
+        self._writer.writerow(record)
+        self._fp.flush()
+
+    def close(self) -> None:
+        self._fp.close()
 
 
 def _targetable_module_names(model) -> List[str]:
@@ -846,6 +914,22 @@ def main() -> None:
         f"{args.per_device_train_batch_size} x {args.gradient_accumulation_steps} = {effective_batch}"
     )
 
+    metrics_path = args.metrics_csv
+    if metrics_path is None:
+        metrics_path = args.output.parent / f"{args.output.stem}_metrics.csv"
+    run_id = str(time.time_ns())
+    metrics_logger = MetricsCSVLogger(metrics_path, run_id=run_id)
+    train_start_time = time.perf_counter()
+    metrics_logger.log(
+        wall_time=time.time(),
+        elapsed_sec=0.0,
+        event="run_start",
+        epoch=0,
+        step_in_epoch=0,
+        global_step=0,
+    )
+    print(f"Logging training metrics to {metrics_path.resolve()} (run_id={run_id})")
+
     if (args.embedding_path is None) != (args.embedding_vocab is None):
         raise ValueError("Both --embedding-path and --embedding-vocab are required to enable averaged embeddings.")
 
@@ -1070,33 +1154,73 @@ def main() -> None:
     global_step = 0
     optimizer.zero_grad(set_to_none=True)
 
+    grad_accum = max(1, int(args.gradient_accumulation_steps))
+    num_train_batches = len(train_loader)
+    remainder = num_train_batches % grad_accum
+    metrics_logger.log(
+        wall_time=time.time(),
+        elapsed_sec=time.perf_counter() - train_start_time,
+        event="train_init",
+        epoch=0,
+        step_in_epoch=0,
+        global_step=0,
+        lr=get_optimizer_lr(optimizer),
+        swa_active=use_swa and global_step >= swa_start_step,
+    )
+
     for epoch in range(1, args.epochs + 1):
         model.train()
-        running_loss = 0.0
-        for step, batch in enumerate(train_loader, start=1):
+        epoch_loss_sum = 0.0
+        epoch_correct = 0
+        epoch_seen = 0
+        log_loss_sum = 0.0
+        log_correct = 0
+        log_seen = 0
+
+        for step_in_epoch, batch in enumerate(train_loader, start=1):
             label_key = "labels" if "labels" in batch else "label"
             labels = batch[label_key].to(device)
             inputs = {k: v.to(device) for k, v in batch.items() if k != label_key}
             with torch.cuda.amp.autocast(enabled=use_amp):
                 outputs = model(**inputs)
-                loss = loss_fn(outputs.logits, labels)
-                loss = loss / args.gradient_accumulation_steps
+                loss_unscaled = loss_fn(outputs.logits, labels)
+                loss_divisor = grad_accum
+                if remainder and step_in_epoch > num_train_batches - remainder:
+                    loss_divisor = remainder
+                loss = loss_unscaled / float(loss_divisor)
 
-            if not torch.isfinite(loss):
+            if not torch.isfinite(loss_unscaled):
                 print(f"[epoch {epoch} step {global_step}] non-finite loss, skipping step.")
                 optimizer.zero_grad(set_to_none=True)
                 continue
 
+            preds = torch.argmax(outputs.logits, dim=-1)
+            batch_correct = (preds == labels).sum().item()
+            batch_seen = labels.size(0)
+
+            loss_value = float(loss_unscaled.item())
+            epoch_loss_sum += loss_value * batch_seen
+            epoch_correct += batch_correct
+            epoch_seen += batch_seen
+            log_loss_sum += loss_value * batch_seen
+            log_correct += batch_correct
+            log_seen += batch_seen
+
             scaler.scale(loss).backward()
-            if step % args.gradient_accumulation_steps == 0:
+            is_optimizer_step = (step_in_epoch % grad_accum == 0) or (step_in_epoch == num_train_batches)
+            if is_optimizer_step:
+                grad_norm = None
                 if args.max_grad_norm and args.max_grad_norm > 0:
                     scaler.unscale_(optimizer)
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
+                    grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
+                    if isinstance(grad_norm, torch.Tensor):
+                        grad_norm = float(grad_norm.item())
                 scaler.step(optimizer)
                 scaler.update()
                 optimizer.zero_grad(set_to_none=True)
                 global_step += 1
 
+                swa_active = use_swa and global_step >= swa_start_step
                 if use_swa and global_step >= swa_start_step:
                     if (global_step - swa_start_step) % args.swa_freq == 0:
                         swa_model.update_parameters(model)
@@ -1104,21 +1228,61 @@ def main() -> None:
                     # Stop cosine decay after SWA starts to keep LR flatter during averaging.
                     scheduler.step()
 
-            running_loss += loss.item() * labels.size(0)
-            if global_step > 0 and global_step % args.logging_steps == 0:
-                avg_loss = running_loss / (step * train_loader.batch_size)
-                print(f"[epoch {epoch} step {global_step}] train loss {avg_loss:.4f}")
+                lr_now = get_optimizer_lr(optimizer)
 
-            if args.eval_steps and global_step > 0 and global_step % args.eval_steps == 0:
-                eval_model = swa_model if use_swa and global_step >= swa_start_step else model
-                val_loss, val_acc = evaluate(eval_model, val_loader, device, loss_fn=loss_fn)
-                print(f"[epoch {epoch} step {global_step}] interim val loss {val_loss:.4f} acc {val_acc:.4f}")
-                model.train()
+                if args.logging_steps and global_step % args.logging_steps == 0:
+                    avg_loss = log_loss_sum / max(1, log_seen)
+                    avg_acc = log_correct / max(1, log_seen)
+                    print(f"[epoch {epoch} step {global_step}] train loss {avg_loss:.4f} acc {avg_acc:.4f}")
+                    metrics_logger.log(
+                        wall_time=time.time(),
+                        elapsed_sec=time.perf_counter() - train_start_time,
+                        event="train_log",
+                        epoch=epoch,
+                        step_in_epoch=step_in_epoch,
+                        global_step=global_step,
+                        lr=lr_now,
+                        swa_active=swa_active,
+                        grad_norm=grad_norm,
+                        train_loss=avg_loss,
+                        train_acc=avg_acc,
+                        train_samples=log_seen,
+                    )
+                    log_loss_sum = 0.0
+                    log_correct = 0
+                    log_seen = 0
+
+                if args.eval_steps and global_step % args.eval_steps == 0:
+                    eval_model = swa_model if swa_active else model
+                    eval_model_name = "swa" if swa_active else "base"
+                    val_loss, val_acc = evaluate(eval_model, val_loader, device, loss_fn=loss_fn)
+                    print(f"[epoch {epoch} step {global_step}] interim val loss {val_loss:.4f} acc {val_acc:.4f}")
+                    metrics_logger.log(
+                        wall_time=time.time(),
+                        elapsed_sec=time.perf_counter() - train_start_time,
+                        event="val_interim",
+                        epoch=epoch,
+                        step_in_epoch=step_in_epoch,
+                        global_step=global_step,
+                        lr=lr_now,
+                        swa_active=swa_active,
+                        eval_model=eval_model_name,
+                        val_loss=val_loss,
+                        val_acc=val_acc,
+                        val_samples=len(val_ds),
+                    )
+                    model.train()
 
         # Choose model to evaluate (SWA if active)
         eval_model = swa_model if use_swa and global_step >= swa_start_step else model
+        eval_model_name = "swa" if use_swa and global_step >= swa_start_step else "base"
         val_loss, val_acc = evaluate(eval_model, val_loader, device, loss_fn=loss_fn)
-        print(f"[epoch {epoch}/{args.epochs}] val loss {val_loss:.4f} acc {val_acc:.4f}")
+        epoch_train_loss = epoch_loss_sum / max(1, epoch_seen)
+        epoch_train_acc = epoch_correct / max(1, epoch_seen)
+        print(
+            f"[epoch {epoch}/{args.epochs}] train loss {epoch_train_loss:.4f} acc {epoch_train_acc:.4f} | "
+            f"val loss {val_loss:.4f} acc {val_acc:.4f}"
+        )
 
         if use_swa and global_step >= swa_start_step:
             swa_scheduler.step()
@@ -1142,12 +1306,63 @@ def main() -> None:
             no_improve += 1
             if no_improve > args.patience:
                 print(f"Early stopping at epoch {epoch}; best epoch was {best_epoch}.")
+                metrics_logger.log(
+                    wall_time=time.time(),
+                    elapsed_sec=time.perf_counter() - train_start_time,
+                    event="early_stop",
+                    epoch=epoch,
+                    step_in_epoch=num_train_batches,
+                    global_step=global_step,
+                    lr=get_optimizer_lr(optimizer),
+                    swa_active=use_swa and global_step >= swa_start_step,
+                    eval_model=eval_model_name,
+                    train_loss=epoch_train_loss,
+                    train_acc=epoch_train_acc,
+                    train_samples=epoch_seen,
+                    val_loss=val_loss,
+                    val_acc=val_acc,
+                    val_samples=len(val_ds),
+                    best_metric=best_metric,
+                    best_epoch=best_epoch,
+                )
                 break
+
+        metrics_logger.log(
+            wall_time=time.time(),
+            elapsed_sec=time.perf_counter() - train_start_time,
+            event="epoch_end",
+            epoch=epoch,
+            step_in_epoch=num_train_batches,
+            global_step=global_step,
+            lr=get_optimizer_lr(optimizer),
+            swa_active=use_swa and global_step >= swa_start_step,
+            eval_model=eval_model_name,
+            train_loss=epoch_train_loss,
+            train_acc=epoch_train_acc,
+            train_samples=epoch_seen,
+            val_loss=val_loss,
+            val_acc=val_acc,
+            val_samples=len(val_ds),
+            best_metric=best_metric,
+            best_epoch=best_epoch,
+        )
 
     if best_state is not None:
         model.load_state_dict(best_state)
         model.to(device)
         print(f"Loaded best checkpoint from epoch {best_epoch} (metric={best_metric:.4f}).")
+        metrics_logger.log(
+            wall_time=time.time(),
+            elapsed_sec=time.perf_counter() - train_start_time,
+            event="load_best",
+            epoch=best_epoch,
+            step_in_epoch=num_train_batches,
+            global_step=global_step,
+            lr=get_optimizer_lr(optimizer),
+            swa_active=use_swa and global_step >= swa_start_step,
+            best_metric=best_metric,
+            best_epoch=best_epoch,
+        )
         if use_swa and global_step >= swa_start_step:
             print("Updating batch norm statistics for SWA weights...")
             update_bn(train_loader, model)
@@ -1163,6 +1378,19 @@ def main() -> None:
             test_preds.extend(preds.cpu().tolist())
 
     write_submission(test_ids, test_preds, args.output)
+    metrics_logger.log(
+        wall_time=time.time(),
+        elapsed_sec=time.perf_counter() - train_start_time,
+        event="run_end",
+        epoch=best_epoch,
+        step_in_epoch=num_train_batches,
+        global_step=global_step,
+        lr=get_optimizer_lr(optimizer),
+        swa_active=use_swa and global_step >= swa_start_step,
+        best_metric=best_metric,
+        best_epoch=best_epoch,
+    )
+    metrics_logger.close()
 
 
 if __name__ == "__main__":
