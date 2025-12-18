@@ -27,7 +27,6 @@ vocab_cut.txt
 *.aux
 *.log
 *.out
-*.pdf
 *.toc
 *.lot
 *.lof
