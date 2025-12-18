@@ -1,56 +1,149 @@
-# Project Text Sentiment Classification
+# EPFL ML Project 2 — Tweet Sentiment (Text Classification)
 
-The task of this competition is to predict if a tweet message used to contain a positive :) or negative :( smiley, by considering only the remaining text.
+This repository contains code for the EPFL ML Project 2 **tweet sentiment** task: predict whether a tweet originally contained a positive `:)` or negative `:(` emoticon, using only the remaining text.
 
-As a baseline, we here provide sample code using word embeddings to build a text classifier system.
+## 1) Setup
 
-Submission system environment setup:
-
-1. The dataset is available from the AIcrowd page, as linked in the PDF project description
-
- Download the provided datasets `twitter-datasets.zip`.
-
-2. To submit your solution to the online evaluation system, we require you to prepare a “.csv” file of the same structure as sampleSubmission.csv (the order of the predictions does not matter, but make sure the tweet ids and predictions match). Your submission is evaluated according to the classification error (number of misclassified tweets) of your predictions.
-
-*Working with Twitter data:* We provide a large set of training tweets, one tweet per line. All tweets in the file train pos.txt (and the train pos full.txt counterpart) used to have positive smileys, those of train neg.txt used to have a negative smiley. Additionally, the file test data.txt contains 10’000 tweets without any labels, each line numbered by the tweet-id.
-
-Your task is to predict the labels of these tweets, and upload the predictions to AIcrowd. Your submission file for the 10’000 tweets must be of the form `<tweet-id>`, `<prediction>`, see `sampleSubmission.csv`.
-
-Note that all tweets have already been pre-processed so that all words (tokens) are separated by a single whitespace. Also, the smileys (labels) have been removed.
-
-## Classification using Word-Vectors
-
-For building a good text classifier, it is crucial to find a good feature representation of the input text. Here we will start by using the word vectors (word embeddings) of each word in the given tweet. For simplicity of a first baseline, we will construct the feature representation of the entire text by simply averaging the word vectors.
-
-Below is a solution pipeline with an evaluation step:
-
-### Generating Word Embeddings: 
-
-Load the training tweets given in `pos_train.txt`, `neg_train.txt` (or a suitable subset depending on RAM requirements), and construct a a vocabulary list of words appearing at least 5 times. This is done running the following commands. Note that the provided `cooc.py` script can take a few minutes to run, and displays the number of tweets processed.
+- **Python**: 3.10+ recommended
+- **Install PyTorch**: follow the official instructions for your platform (CPU/CUDA).
+- **Install the remaining dependencies** (after PyTorch):
 
 ```bash
-build_vocab.sh
-cut_vocab.sh
-python3 pickle_vocab.py
-python3 cooc.py
+python3 -m pip install -U pip
+python3 -m pip install numpy scipy scikit-learn transformers datasets
+# Optional (only if you use LoRA)
+python3 -m pip install peft
+# Optional (only if you enable --demojize-emojis)
+python3 -m pip install emoji
 ```
 
+## 2) Data
 
-Now given the co-occurrence matrix and the vocabulary, it is not hard to train GloVe word embeddings, that is to compute an embedding vector for wach word in the vocabulary. We suggest to implement SGD updates to train the matrix factorization, as in
+Place the AIcrowd dataset files under:
 
-```glove_solution.py```
+```
+project_text_classification_EPFL/
+  data/twitter-datasets/
+    train_pos.txt
+    train_neg.txt
+    train_pos_full.txt
+    train_neg_full.txt
+    test_data.txt
+```
 
-Once you tested your system on the small set of 10% of all tweets, we suggest you run on the full datasets `pos_train_full.txt`, `neg_train_full.txt`
+You can download the dataset from the AIcrowd challenge page (see `project2_description.pdf`).
 
-### Building a Text Classifier:
+### Optional: download via script
 
-1. Construct Features for the Training Texts: Load the training tweets and the built GloVe word embeddings. Using the word embeddings, construct a feature representation of each training tweet (by averaging the word vectors over all words of the tweet).
+A helper `download_dataset.py` exists, but it depends on the `aicrowd` Python package / credentials. If it fails, download manually and unzip into `data/twitter-datasets/`.
 
-2. Train a Linear Classifier: Train a linear classifier (e.g. logistic regression or SVM) on your constructed features, using the scikit learn library, or your own code from the earlier labs. Recall that the labels indicate if a tweet used to contain a :) or :( smiley.
+## 3) Quickstart — Baselines
 
-3. Prediction: Predict labels for all tweets in the test set.
+All commands below assume you run them from `project_text_classification_EPFL/`.
 
-4. Submission / Evaluation: Submit your predictions to AIcrowd, and verify the obtained misclassification error score. (You can also use a local separate validation set to get faster feedback on the accuracy of your system). Try to tune your system for best evaluation score.
+### A) Hashed n-gram baseline (fast, no embeddings needed)
 
-## Extensions:
-Naturally, there are many ways to improve your solution, both in terms of accuracy and computation speed. More advanced techniques can be found in the recent literature.
+```bash
+python3 baseline_classifier.py --use-full --device auto \
+  --representation hash --ngram-max 2 --num-features 262144 \
+  --epochs 5 --batch-size 2048 \
+  --output baseline_hash.csv
+```
+
+### B) Embedding-bag baseline (requires `vocab.pkl` + `embeddings.npy`)
+
+If you already have `vocab.pkl` and `embeddings.npy`, you can run:
+
+```bash
+python3 baseline_classifier.py --use-full --device auto \
+  --representation vocab --vocab-path vocab.pkl --embeddings-path embeddings.npy \
+  --epochs 5 --batch-size 2048 \
+  --output baseline_vocab.csv
+```
+
+## 4) (Optional) Build in-domain GloVe resources
+
+This pipeline builds a vocabulary, a co-occurrence matrix, then trains GloVe embeddings.
+
+```bash
+./build_vocab.sh
+./cut_vocab.sh
+python3 pickle_vocab.py
+python3 cooc.py
+python3 glove_solution.py
+```
+
+Outputs:
+- `vocab.pkl`
+- `cooc.pkl`
+- `embeddings.npy`
+
+Notes:
+- `build_vocab.sh` / `cut_vocab.sh` use standard Unix tools (`cat`, `sed`, `sort`, `uniq`, `grep`).
+- `cooc.py` can take time and uses the smaller `train_pos.txt` / `train_neg.txt` by default.
+
+## 5) BERTweet fine-tuning (3 setups)
+
+The main transformer script is `distilbert_classifier.py` (it supports BERTweet via `--model-name vinai/bertweet-base`).
+
+### A) Head-only training (frozen encoder)
+
+```bash
+python3 distilbert_classifier.py --use-full --device cuda \
+  --model-name vinai/bertweet-base --freeze-encoder \
+  --val-size 0.05 --epochs 3 \
+  --output bertweet_head.csv
+```
+
+Optional: include averaged-GloVe fusion (needs `embeddings.npy` + `vocab.pkl`):
+
+```bash
+python3 distilbert_classifier.py --use-full --device cuda \
+  --model-name vinai/bertweet-base --freeze-encoder \
+  --val-size 0.05 --epochs 3 \
+  --embedding-path embeddings.npy --embedding-vocab vocab.pkl \
+  --estimate-embedding-scale \
+  --output bertweet_head_fusion.csv
+```
+
+### B) LoRA (parameter-efficient fine-tuning)
+
+Requires `peft`:
+
+```bash
+python3 distilbert_classifier.py --use-full --device cuda \
+  --model-name vinai/bertweet-base --use-lora --lora-target-modules auto \
+  --val-size 0.05 --epochs 3 \
+  --output bertweet_lora.csv
+```
+
+### C) Full fine-tuning (+ optional SWA)
+
+```bash
+python3 distilbert_classifier.py --use-full --device cuda \
+  --model-name vinai/bertweet-base \
+  --val-size 0.05 --epochs 3 \
+  --output bertweet_full.csv
+```
+
+Optional SWA:
+
+```bash
+python3 distilbert_classifier.py --use-full --device cuda \
+  --model-name vinai/bertweet-base \
+  --val-size 0.05 --epochs 3 \
+  --use-swa --swa-start-epoch 1 --swa-freq 300 \
+  --output bertweet_full_swa.csv
+```
+
+A recommended configuration used during our runs is documented in `run_distilbert.sh`.
+
+## 6) Submission format
+
+All training scripts write a CSV with header:
+
+```
+Id,Prediction
+```
+
+Predictions are mapped to **{-1, +1}** (negative → `-1`, positive → `+1`). Upload the CSV to AIcrowd.
